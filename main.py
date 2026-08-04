@@ -1169,6 +1169,15 @@ def strategic_first_attempt(
                 active_strategy_slot_count,
                 STRATEGIC_MODE,
             )
+            if os.getenv("ROTATE_OCR_FALLBACK_URL", "").strip():
+                rotate_fallback_deadline = (
+                    target_dt
+                    - datetime.timedelta(milliseconds=TEXTCLICK_FIRST_CAPTCHA_GUARD_MS)
+                    + datetime.timedelta(seconds=10)
+                )
+                os.environ["ROTATE_OCR_FALLBACK_DEADLINE_EPOCH"] = str(
+                    rotate_fallback_deadline.timestamp()
+                )
             multi_slot_soft_deadline = (
                 active_strategy_slot_count > 1 and STRATEGIC_MODE in {"A", "C"}
             )

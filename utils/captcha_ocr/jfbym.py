@@ -2,11 +2,14 @@
 
 import base64
 import logging
+import os
 import re
 import time
 from typing import Optional
 
 import requests
+
+from .hard_timeout import post_json_with_hard_timeout
 
 
 class JfbymOCR:
@@ -17,6 +20,7 @@ class JfbymOCR:
     def __init__(self, token: str, type_id: str):
         self.token = str(token or "").strip()
         self.type_id = str(type_id or "").strip()
+        self.last_error = None
         self.headers = {"Content-Type": "application/json"}
 
     @staticmethod
@@ -72,6 +76,7 @@ class JfbymOCR:
         return cls._parse_positions_from_text(str(payload)) or None
 
     def recognize_iconclick(self, img_data: bytes) -> Optional[list[dict]]:
+        self.last_error = None
         b64_data = self._normalize_base64(base64.b64encode(img_data).decode("ascii"))
         data = {
             "token": self.token,
@@ -81,15 +86,15 @@ class JfbymOCR:
         request_started = time.monotonic()
         logging.info("jfbym 图标点选请求已开始，type=%s", self.type_id)
         try:
-            response = requests.request(
-                "POST",
-                self.API_URL,
-                headers=self.headers,
-                json=data,
-                timeout=30,
-            )
-            result = response.json()
+            if os.getenv("ROTATE_OCR_FALLBACK_URL"):
+                result = post_json_with_hard_timeout(self.API_URL, data)
+            else:
+                response = requests.request(
+                    "POST", self.API_URL, headers=self.headers, json=data, timeout=30
+                )
+                result = response.json()
         except Exception as e:
+            self.last_error = e
             logging.warning(
                 "jfbym 图标点选请求失败，耗时 %.3f 秒：%s",
                 time.monotonic() - request_started,

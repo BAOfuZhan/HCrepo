@@ -8,6 +8,24 @@ const parserSource = html.slice(
   html.indexOf("function createEmptyWeeklySchedule"),
 );
 const extractPlanTextMapping = Function(`${parserSource}; return extractPlanTextMapping;`)();
+const formatterSource = html.slice(
+  html.indexOf("function scheduleToJsonMapping"),
+  html.indexOf("function fillScheduleFormFromSchedule"),
+);
+const scheduleToStandardText = Function(`
+  const parseTimesInput = value => String(value).split("-");
+  ${formatterSource}
+  return scheduleToStandardText;
+`)();
+const inheritanceSource = html.slice(
+  html.indexOf("function inheritMappedUserScheduleConfig"),
+  html.indexOf("function applyScheduleJsonToForm"),
+);
+const inheritMappedUserScheduleConfig = Function(`
+  const currentSchool = { fidEnc: "school-fid" };
+  ${inheritanceSource}
+  return inheritMappedUserScheduleConfig;
+`)();
 const base = "自习室id：13476\n座位号:367\n";
 const allDays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const fullWeeklyText = `自习室id:9908
@@ -54,6 +72,42 @@ assert.deepEqual(mondayPlans.map(plan => plan.daysofweek), [["Monday"], ["Monday
 const fullTongyiPlans = extractPlanTextMapping(fullWeeklyText, { maxHoursPerObject: 0 });
 assert.equal(fullTongyiPlans.length, 14);
 assert.deepEqual(fullTongyiPlans.slice(0, 2).map(plan => plan.times), [["08:00", "12:00"], ["12:30", "16:30"]]);
+
+const standardSchedule = Object.fromEntries(allDays.map(day => [day, {
+  enabled: true,
+  slots: [{ roomid: "13473", seatid: "424", times: "10:00-22:30" }],
+}]));
+assert.equal(scheduleToStandardText(standardSchedule), `自习室id:13473
+座位号:424
+时间段:
+周一:10:00-22:30
+周二:10:00-22:30
+周三:10:00-22:30
+周四:10:00-22:30
+周五:10:00-22:30
+周六:10:00-22:30
+周日:10:00-22:30`);
+
+const inheritedSchedule = inheritMappedUserScheduleConfig({
+  Monday: { enabled: true, slots: [{ roomid: "changed", seatid: "999", times: "10:00-22:30" }] },
+}, {
+  Monday: { enabled: true, slots: [{
+    roomid: "13473",
+    seatid: "424",
+    times: "08:00-22:00",
+    seatPageId: "page-1",
+    fidEnc: "user-fid",
+    backupSeats: "13473-425",
+  }] },
+});
+assert.deepEqual(inheritedSchedule.Monday.slots[0], {
+  roomid: "13473",
+  seatid: "999",
+  times: "10:00-22:30",
+  seatPageId: "page-1",
+  fidEnc: "user-fid",
+  backupSeats: "13473-425",
+});
 
 const appSource = await readFile(new URL("../qianduan/app.js", import.meta.url), "utf8");
 const qianduanParserSource = appSource.slice(

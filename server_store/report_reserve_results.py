@@ -23,6 +23,11 @@ PROCESSED_RESULTS_FILE = "processed_results.json"
 REPORT_STATE_FILE = "result_report_state.json"
 MAX_LOG_CHARS = 700_000
 BEIJING_TZ = dt.timezone(dt.timedelta(hours=8))
+REPORT_WINDOWS = {
+    "noon": (dt.time(4, 0), dt.time(12, 0)),
+    "evening": (dt.time(12, 3), dt.time(20, 0)),
+    "night": (dt.time(20, 3), dt.time(22, 0)),
+}
 
 
 def beijing_now() -> dt.datetime:
@@ -214,7 +219,48 @@ def parse_run_dir_datetime(name: str) -> dt.datetime | None:
         return None
 
 
-def iter_today_run_dirs(runs_dir: pathlib.Path, today: dt.date | None = None) -> list[pathlib.Path]:
+def run_started_at(run_dir: pathlib.Path) -> dt.datetime | None:
+    summary = load_json(run_dir / "summary.json", {})
+    for key in ("started_at", "startedAt"):
+        raw = normalize_text(summary.get(key), 80)
+        if not raw:
+            continue
+        try:
+            parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=BEIJING_TZ) if parsed.tzinfo is None else parsed.astimezone(BEIJING_TZ)
+        except ValueError:
+            pass
+    parsed = parse_run_dir_datetime(run_dir.name)
+    if parsed is not None:
+        return parsed
+    for name in ("summary.json", "payload.json"):
+        path = run_dir / name
+        if path.exists():
+            return dt.datetime.fromtimestamp(path.stat().st_mtime, BEIJING_TZ)
+    return None
+
+
+def run_is_active(run_dir: pathlib.Path) -> bool:
+    accepted = load_json(run_dir / "accepted.json", {})
+    try:
+        pid = int(accepted.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        command = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore")
+    except OSError:
+        return False
+    payload_path = str((run_dir / "payload.json").resolve())
+    return "run_batch.py" in command and payload_path in command
+
+
+def iter_today_run_dirs(
+    runs_dir: pathlib.Path,
+    today: dt.date | None = None,
+    report_window: str = "",
+) -> list[pathlib.Path]:
     if not runs_dir.exists():
         return []
     target_day = today or beijing_now().date()
@@ -226,20 +272,21 @@ def iter_today_run_dirs(runs_dir: pathlib.Path, today: dt.date | None = None) ->
         payload_path = entry / "payload.json"
         if not summary_path.exists() and not payload_path.exists():
             continue
+        if not summary_path.exists() and run_is_active(entry):
+            continue
         if not summary_path.exists() and not any(entry.rglob("*.log")):
             continue
-        run_dt = parse_run_dir_datetime(entry.name)
-        if run_dt is not None:
-            if run_dt.date() == target_day:
-                items.append(entry)
-            continue
         try:
-            timestamp_path = summary_path if summary_path.exists() else payload_path
-            mtime = dt.datetime.fromtimestamp(timestamp_path.stat().st_mtime, BEIJING_TZ)
+            run_dt = run_started_at(entry)
         except Exception:
             continue
-        if mtime.date() == target_day:
-            items.append(entry)
+        if run_dt is None or run_dt.date() != target_day:
+            continue
+        if report_window:
+            start_time, end_time = REPORT_WINDOWS[report_window]
+            if not (start_time <= run_dt.time().replace(tzinfo=None) <= end_time):
+                continue
+        items.append(entry)
     items.sort(key=lambda path: path.name)
     return items
 
@@ -503,8 +550,14 @@ def format_admin_timeline(timeline: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def last_failure_message(attempts: list[dict], log_text: str) -> str:
-    for attempt in reversed(attempts):
+def preferred_failure_message(attempt_results: list[dict], attempts: list[dict], log_text: str) -> str:
+    for attempt in attempt_results:
+        if attempt.get("source") != "primary":
+            continue
+        message = normalize_text(attempt.get("message"), 300)
+        if message:
+            return message
+    for attempt in attempts:
         result = attempt.get("result")
         if isinstance(result, dict):
             msg = normalize_text(result.get("msg"), 300)
@@ -523,8 +576,8 @@ def last_failure_message(attempts: list[dict], log_text: str) -> str:
 
 
 def classify_failure(log_text: str, message: str, returncode: int) -> tuple[str, str]:
-    combined = f"{message}\n{log_text[-12000:]}".lower()
-    raw_combined = f"{message}\n{log_text[-12000:]}"
+    raw_combined = message or log_text[-12000:]
+    combined = raw_combined.lower()
     if "代码:302" in raw_combined or "代码：302" in raw_combined:
         return "submit_security_timeout_302", message or "页面安全验证超时（代码302），未能确认预约结果"
     if "代码:303" in raw_combined or "代码：303" in raw_combined:
@@ -674,8 +727,8 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
             or (not slot_time and attempt.get("attemptSeat") in primary_seats + backup_seats)
         ]
         success_detail = next((attempt for attempt in related_attempts if attempt.get("success")), None)
-        last_detail = related_attempts[-1] if related_attempts else {}
-        final_detail = success_detail or last_detail
+        primary_detail = next((attempt for attempt in related_attempts if attempt.get("source") == "primary"), None)
+        final_detail = success_detail or primary_detail or (related_attempts[0] if related_attempts else {})
         final_source = normalize_text(final_detail.get("source"), 30)
         success = bool(success_detail)
         if success:
@@ -747,7 +800,7 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
     else:
         primary_result = "failed"
         backup_result = "failed" if backup else "skipped"
-        message = last_failure_message(attempts, log_text)
+        message = preferred_failure_message(attempt_results, attempts, log_text)
         error_code, final_reason = classify_failure(log_text, message, returncode)
 
     task_id = "_".join(
@@ -929,6 +982,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Report runs even when result_report_state.json says they were sent")
     parser.add_argument("--run-dir", default="", help="Process a single server_runs/<run_id> directory")
+    parser.add_argument("--window", choices=sorted(REPORT_WINDOWS), default="", help="Only report runs started in this configured Beijing-time window")
     args = parser.parse_args()
 
     project_root = pathlib.Path(args.project_root).expanduser().resolve()
@@ -949,7 +1003,7 @@ def main() -> int:
             except ValueError:
                 print(f"Invalid --date value: {args.date}", file=sys.stderr)
                 return 2
-        run_dirs = iter_today_run_dirs(runs_dir, report_date)
+        run_dirs = iter_today_run_dirs(runs_dir, report_date, args.window)
 
     all_results: list[dict] = []
     processed_runs: list[dict] = []
@@ -969,7 +1023,7 @@ def main() -> int:
         return 0
 
     if not all_results:
-        print(json.dumps({"ok": True, "message": "no pending results", "skippedRuns": skipped_runs}, ensure_ascii=False))
+        print(json.dumps({"ok": True, "message": "no pending results", "window": args.window, "skippedRuns": skipped_runs}, ensure_ascii=False))
         return 0
     if local_db_mode:
         response = write_results_to_local_db(all_results)
@@ -1000,7 +1054,7 @@ def main() -> int:
             },
         )
 
-    print(json.dumps({"ok": ok, "runs": processed_runs, "skippedRuns": skipped_runs, "response": response}, ensure_ascii=False, indent=2))
+    print(json.dumps({"ok": ok, "window": args.window, "runs": processed_runs, "skippedRuns": skipped_runs, "response": response}, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
 

@@ -1,11 +1,14 @@
 import base64
 import logging
+import os
 import re
 import time
 from hashlib import md5
 from typing import Optional
 
 import requests
+
+from .hard_timeout import post_form_with_hard_timeout
 
 
 class ChaojiyingOCR:
@@ -24,6 +27,7 @@ class ChaojiyingOCR:
         self.password_md5 = md5(password.encode("utf-8")).hexdigest()
         self.soft_id = str(soft_id)
         self.codetype = int(codetype)
+        self.last_error = None
         self.headers = {
             "Connection": "Keep-Alive",
             "User-Agent": "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0)",
@@ -66,6 +70,7 @@ class ChaojiyingOCR:
         return coordinates
 
     def recognize_textclick(self, img_data: bytes) -> Optional[dict]:
+        self.last_error = None
         b64_data = base64.b64encode(img_data).decode("ascii")
         params = {
             "user": self.username,
@@ -75,14 +80,15 @@ class ChaojiyingOCR:
             "file_base64": self._normalize_base64(b64_data),
         }
         try:
-            response = requests.post(
-                self.API_URL,
-                data=params,
-                headers=self.headers,
-                timeout=30,
-            )
-            result = response.json()
+            if os.getenv("ROTATE_OCR_FALLBACK_URL"):
+                result = post_form_with_hard_timeout(self.API_URL, params)
+            else:
+                response = requests.post(
+                    self.API_URL, data=params, headers=self.headers, timeout=30
+                )
+                result = response.json()
         except Exception as e:
+            self.last_error = e
             logging.debug("Chaojiying OCR request failed: %s", e)
             return None
 
@@ -114,6 +120,7 @@ class ChaojiyingOCR:
 
     def recognize_iconclick(self, img_data: bytes) -> Optional[list[dict]]:
         """使用 9103 返回按点击顺序排列的 x,y 坐标。"""
+        self.last_error = None
         b64_data = base64.b64encode(img_data).decode("ascii")
         params = {
             "user": self.username,
@@ -125,15 +132,16 @@ class ChaojiyingOCR:
         request_started = time.monotonic()
         logging.info("超级鹰 9103 请求已开始")
         try:
-            response = requests.post(
-                self.API_URL,
-                data=params,
-                headers=self.headers,
-                timeout=30,
-            )
+            if os.getenv("ROTATE_OCR_FALLBACK_URL"):
+                result = post_form_with_hard_timeout(self.API_URL, params)
+            else:
+                response = requests.post(
+                    self.API_URL, data=params, headers=self.headers, timeout=30
+                )
+                result = response.json()
             response_received = time.monotonic()
-            result = response.json()
         except Exception as e:
+            self.last_error = e
             logging.warning(
                 "超级鹰 9103 请求失败，耗时 %.3f 秒：%s",
                 time.monotonic() - request_started,

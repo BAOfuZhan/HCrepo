@@ -25,7 +25,9 @@ if [[ -z "$TARGET_CF_API_TOKEN" ]]; then
   exit 1
 fi
 
-TMP_CONFIG="$(mktemp "$WORKDIR/tongyi-target-wrangler.XXXXXX.toml")"
+TMP_CONFIG_BASE="$(mktemp "$WORKDIR/tongyi-target-wrangler.XXXXXX")"
+TMP_CONFIG="$TMP_CONFIG_BASE.toml"
+mv "$TMP_CONFIG_BASE" "$TMP_CONFIG"
 trap 'rm -f "$TMP_CONFIG"' EXIT
 
 python3 - "$WORKDIR/wrangler.toml" "$TMP_CONFIG" "$TARGET_CF_ACCOUNT_ID" "$TARGET_CF_KV_NAMESPACE_ID" "$TARGET_TONGYI_WORKER_NAME" <<'PY'

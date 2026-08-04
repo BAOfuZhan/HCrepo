@@ -96,6 +96,8 @@ jobs:
           CHAOJIYING_CODETYPE: ${{ secrets.CHAOJIYING_CODETYPE }}
           TULINGCLOUD_USERNAME: ${{ secrets.TULINGCLOUD_USERNAME }}
           TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
+          ROTATE_OCR_FALLBACK_URL: http://62.234.222.77
+          ROTATE_OCR_FALLBACK_API_KEY: ${{ secrets.SERVER_DISPATCH_API_KEY || secrets.ROTATE_OCR_FALLBACK_API_KEY || github.event.client_payload.server_api_key }}
         run: |
           set +e
           python main.py --action --dispatch 2>&1 | tee reserve.log
@@ -353,6 +355,8 @@ jobs:
           CHAOJIYING_CODETYPE: ${{ secrets.CHAOJIYING_CODETYPE }}
           TULINGCLOUD_USERNAME: ${{ secrets.TULINGCLOUD_USERNAME }}
           TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
+          ROTATE_OCR_FALLBACK_URL: http://62.234.222.77
+          ROTATE_OCR_FALLBACK_API_KEY: ${{ secrets.SERVER_DISPATCH_API_KEY || secrets.ROTATE_OCR_FALLBACK_API_KEY }}
         run: |
           set +e
           python main.py --action 2>&1 | tee reserve.log

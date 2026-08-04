@@ -1,4 +1,5 @@
 from utils import AES_Encrypt, enc, generate_captcha_key, verify_param
+import base64
 import json
 import requests
 import re
@@ -109,6 +110,50 @@ def _get_tulingcloud_config(
 def _get_jfbym_config(captcha_type: str | None = "iconclick"):
     """从 captcha_ocr/config.py 获取 jfbym token 和类型 ID。"""
     return jfbym_token(), jfbym_type_id(captcha_type)
+
+
+def _recognize_via_server_fallback(kind: str, image_bytes: bytes, **extra):
+    """GitHub-only OCR fallback; the workflow injects the URL and API key."""
+    base_url = os.getenv("ROTATE_OCR_FALLBACK_URL", "").strip().rstrip("/")
+    if not base_url:
+        return None
+    for suffix in ("/dispatch", "/stage", "/ocr/rotate"):
+        if base_url.endswith(suffix):
+            base_url = base_url[: -len(suffix)]
+            break
+    deadline_text = os.getenv("ROTATE_OCR_FALLBACK_DEADLINE_EPOCH", "").strip()
+    try:
+        deadline = float(deadline_text) if deadline_text else None
+    except ValueError:
+        deadline = None
+    payload = {
+        "kind": kind,
+        "image_b64": base64.b64encode(image_bytes).decode("ascii"),
+        **extra,
+    }
+    headers = {"X-API-Key": os.getenv("ROTATE_OCR_FALLBACK_API_KEY", "")}
+    attempt = 0
+    while deadline is None or time.time() < deadline:
+        attempt += 1
+        try:
+            remaining = deadline - time.time() if deadline is not None else 20.0
+            response = requests.post(
+                f"{base_url}/ocr/recognize",
+                json=payload,
+                headers=headers,
+                timeout=(min(3.0, max(0.1, remaining)), min(20.0, max(0.1, remaining))),
+            )
+            response.raise_for_status()
+            result = response.json()
+            if result.get("ok") is True:
+                logging.info("服务器 %s OCR 备用接口第%d次识别成功", kind, attempt)
+                return result
+        except Exception as exc:
+            logging.warning("服务器 %s OCR 备用接口第%d次失败：%s", kind, attempt, exc)
+        if deadline is None:
+            return None
+        time.sleep(min(0.2, max(0.0, deadline - time.time())))
+    return None
 
 
 def get_date(day_offset: int = 0):
@@ -1297,6 +1342,7 @@ class reserve:
         if not captcha_token or not image_url:
             logging.warning("获取图标点选验证码数据失败")
             return ""
+        ocr_client = None
         try:
             import cv2
             import numpy as np
@@ -1330,42 +1376,62 @@ class reserve:
                 )
                 if not all([username, password, model_id]):
                     logging.error("未配置图灵云图标点选所需的账号信息")
-                    return ""
-                logging.info("图标点选使用图灵云识别，model_id=%s，提交裁剪图", model_id)
-                positions = TulingCloudOCR(
-                    username=username,
-                    password=password,
-                    model_id=model_id,
-                ).recognize_iconclick(cropped_image_bytes)
+                    positions = None
+                else:
+                    logging.info("图标点选使用图灵云识别，model_id=%s，提交裁剪图", model_id)
+                    ocr_client = TulingCloudOCR(
+                        username=username,
+                        password=password,
+                        model_id=model_id,
+                    )
+                    positions = ocr_client.recognize_iconclick(cropped_image_bytes)
             elif self.iconclick_ocr_provider == "jfbym":
                 from utils.captcha_ocr import JfbymOCR
 
                 token, type_id = _get_jfbym_config("iconclick")
                 if not token:
                     logging.error("未在 utils/captcha_ocr/config.py 配置 jfbym 图标点选 token")
-                    return ""
-                if not type_id:
+                    positions = None
+                elif not type_id:
                     logging.error("未在 utils/captcha_ocr/config.py 配置 jfbym 图标点选 type_id")
-                    return ""
-                logging.info("图标点选使用 jfbym 识别，type=%s，提交原图", type_id)
-                positions = JfbymOCR(
-                    token=token,
-                    type_id=type_id,
-                ).recognize_iconclick(image_response.content)
+                    positions = None
+                else:
+                    logging.info("图标点选使用 jfbym 识别，type=%s，提交原图", type_id)
+                    ocr_client = JfbymOCR(
+                        token=token,
+                        type_id=type_id,
+                    )
+                    positions = ocr_client.recognize_iconclick(image_response.content)
             else:
                 from utils.captcha_ocr import ChaojiyingOCR
 
                 username, password, soft_id, _ = _get_chaojiying_config()
                 if not all([username, password, soft_id]):
                     logging.error("未配置图标点选所需的超级鹰账号信息")
-                    return ""
-                logging.info("图标点选使用超级鹰 9103 识别")
-                positions = ChaojiyingOCR(
-                    username, password, soft_id, codetype=9103
-                ).recognize_iconclick(cropped_image_bytes)
+                    positions = None
+                else:
+                    logging.info("图标点选使用超级鹰 9103 识别")
+                    ocr_client = ChaojiyingOCR(
+                        username, password, soft_id, codetype=9103
+                    )
+                    positions = ocr_client.recognize_iconclick(cropped_image_bytes)
         except Exception as e:
             logging.warning("图标点选识别失败：%s", e)
-            return ""
+            positions = None
+        if not positions and isinstance(
+            getattr(ocr_client, "last_error", None), requests.exceptions.ConnectTimeout
+        ):
+            fallback_image = (
+                image_response.content
+                if self.iconclick_ocr_provider == "jfbym"
+                else cropped_image_bytes
+            )
+            fallback = _recognize_via_server_fallback(
+                "iconclick",
+                fallback_image,
+                provider=self.iconclick_ocr_provider,
+            )
+            positions = fallback.get("positions") if fallback else None
         if not positions:
             return ""
         logging.info("图标点选坐标：%s", positions)
@@ -1945,6 +2011,7 @@ class reserve:
             except Exception as e:
                 logging.debug(f"Failed to save captcha image: {e}")
         
+        ocr = None
         try:
             from utils.captcha_ocr import ChaojiyingOCR
 
@@ -1975,6 +2042,10 @@ class reserve:
                         )
                         positions = None
                     else:
+                        if isinstance(ocr.last_error, requests.exceptions.ConnectTimeout):
+                            positions = None
+                            logging.warning("Chaojiying textclick OCR 连接超时，切换服务器备用接口")
+                            break
                         logging.info(
                             "Chaojiying textclick OCR request attempt %d/3 took %.3fs",
                             attempt,
@@ -2009,6 +2080,19 @@ class reserve:
         except Exception as e:
             logging.warning(f"Chaojiying textclick OCR raised: {e}")
 
+        fallback = (
+            _recognize_via_server_fallback("textclick", img_bytes)
+            if isinstance(getattr(ocr, "last_error", None), requests.exceptions.ConnectTimeout)
+            else None
+        )
+        if fallback:
+            positions = self._match_textclick_ocr_positions(
+                fallback.get("result"),
+                target_text,
+                "server fallback",
+            )
+            if positions:
+                return positions
         return None
 
     def get_slide_captcha_data(self):

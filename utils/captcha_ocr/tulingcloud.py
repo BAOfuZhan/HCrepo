@@ -7,17 +7,90 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 import time
 from typing import Optional
 
 from PIL import Image, ImageDraw
 
+from .hard_timeout import post_json_with_hard_timeout
+
 
 class TulingCloudOCR:
     """图灵云打码平台API调用类"""
     
     TULINGCLOUD_API_URL = "http://www.tulingcloud.com/tuling/predict"
+
+    @staticmethod
+    def rotate_fallback_url(url: str) -> str:
+        """Turn a configured dispatch URL into the rotate OCR endpoint."""
+        url = str(url or "").strip().rstrip("/")
+        if not url:
+            return ""
+        if url.endswith("/dispatch"):
+            return f"{url[:-len('/dispatch')]}/ocr/rotate"
+        if url.endswith("/stage"):
+            return f"{url[:-len('/stage')]}/ocr/rotate"
+        if url.endswith("/ocr/rotate"):
+            return url
+        return f"{url}/ocr/rotate"
+
+    @classmethod
+    def recognize_rotate_angle_via_fallback(
+        cls,
+        image_bytes: bytes,
+        *,
+        url: str,
+        api_key: str = "",
+    ) -> Optional[float]:
+        import requests
+
+        endpoint = cls.rotate_fallback_url(url)
+        if not endpoint:
+            return None
+        headers = {"X-API-Key": api_key} if api_key else {}
+        payload = {"image_b64": base64.b64encode(image_bytes).decode("ascii")}
+        deadline_text = os.getenv("ROTATE_OCR_FALLBACK_DEADLINE_EPOCH", "").strip()
+        try:
+            deadline = float(deadline_text) if deadline_text else None
+        except ValueError:
+            deadline = None
+        attempt = 0
+        while deadline is None or time.time() < deadline:
+            attempt += 1
+            started_at = time.monotonic()
+            try:
+                remaining = deadline - time.time() if deadline is not None else 20.0
+                response = requests.post(
+                    endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=(min(3.0, max(0.1, remaining)), min(20.0, max(0.1, remaining))),
+                )
+                response.raise_for_status()
+                result = response.json()
+                angle = result.get("angle")
+                if result.get("ok") is not True or angle is None:
+                    raise ValueError(result.get("error") or "response missing angle")
+                logging.info(
+                    "服务器 rotate OCR 备用接口成功：第%d次，耗时=%.3f秒",
+                    attempt,
+                    time.monotonic() - started_at,
+                )
+                return float(angle)
+            except Exception as e:
+                logging.warning(
+                    "服务器 rotate OCR 备用接口失败：第%d次，耗时=%.3f秒，错误=%s",
+                    attempt,
+                    time.monotonic() - started_at,
+                    e,
+                )
+                if deadline is None:
+                    return None
+                time.sleep(min(0.2, max(0.0, deadline - time.time())))
+        logging.warning("服务器 rotate OCR 备用接口已停止：达到硬截止时间后10秒")
+        return None
     
     def __init__(self, username: str, password: str, model_id: str):
         """
@@ -31,6 +104,7 @@ class TulingCloudOCR:
         self.username = username
         self.password = password
         self.model_id = model_id
+        self.last_error = None
 
     @staticmethod
     def clamp_rotate_x(x: int, slider_max_x: int = 278) -> int:
@@ -213,6 +287,7 @@ class TulingCloudOCR:
           }
         }
         """
+        self.last_error = None
         try:
             import requests
 
@@ -223,14 +298,16 @@ class TulingCloudOCR:
                 "b64": base64.b64encode(img_data).decode("ascii"),
                 "version": "3.1.1",
             }
-            response = requests.post(
-                self.TULINGCLOUD_API_URL,
-                json=payload,
-                timeout=30,
-            )
-            result = response.json()
+            if os.getenv("ROTATE_OCR_FALLBACK_URL"):
+                result = post_json_with_hard_timeout(self.TULINGCLOUD_API_URL, payload)
+            else:
+                response = requests.post(
+                    self.TULINGCLOUD_API_URL, json=payload, timeout=30
+                )
+                result = response.json()
             logging.debug("TulingCloud iconclick API response: %s", result)
         except Exception as e:
+            self.last_error = e
             logging.warning("TulingCloud iconclick recognition request failed: %s", e)
             return None
 
@@ -281,6 +358,13 @@ class TulingCloudOCR:
             logging.warning("图灵云 rotate OCR 请求失败：缺少 requests，错误=%s", e)
             return None
 
+        def _fallback() -> Optional[float]:
+            return self.recognize_rotate_angle_via_fallback(
+                image_bytes,
+                url=os.getenv("ROTATE_OCR_FALLBACK_URL", ""),
+                api_key=os.getenv("ROTATE_OCR_FALLBACK_API_KEY", ""),
+            )
+
         payload = {
             "username": self.username,
             "password": self.password,
@@ -288,13 +372,25 @@ class TulingCloudOCR:
             "b64": base64.b64encode(image_bytes).decode("ascii"),
             "version": "3.1.1",
         }
+        fallback_url = os.getenv("ROTATE_OCR_FALLBACK_URL", "").strip()
         started_at = time.monotonic()
         try:
-            response = requests.post(
-                self.TULINGCLOUD_API_URL,
-                data=json.dumps(payload),
-                timeout=15,
+            if fallback_url:
+                result = post_json_with_hard_timeout(self.TULINGCLOUD_API_URL, payload)
+                response = None
+            else:
+                response = requests.post(
+                    self.TULINGCLOUD_API_URL,
+                    data=json.dumps(payload),
+                    timeout=15,
+                )
+        except requests.exceptions.ConnectTimeout as e:
+            logging.warning(
+                "图灵云 rotate OCR 请求失败：耗时=%.3f秒，错误=%s",
+                time.monotonic() - started_at,
+                e,
             )
+            return _fallback()
         except Exception as e:
             logging.warning(
                 "图灵云 rotate OCR 请求失败：耗时=%.3f秒，错误=%s",
@@ -303,21 +399,13 @@ class TulingCloudOCR:
             )
             return None
         elapsed = time.monotonic() - started_at
-        logging.info(
-            "图灵云 rotate OCR 请求完成：HTTP %s，耗时=%.3f秒",
-            response.status_code,
-            elapsed,
-        )
-        try:
-            result = response.json()
-        except Exception as e:
-            logging.warning(
-                "图灵云 rotate OCR 响应解析失败：HTTP %s，耗时=%.3f秒，错误=%s",
-                response.status_code,
-                elapsed,
-                e,
-            )
-            return None
+        logging.info("图灵云 rotate OCR 请求完成：耗时=%.3f秒", elapsed)
+        if response is not None:
+            try:
+                result = response.json()
+            except Exception as e:
+                logging.warning("图灵云 rotate OCR 响应解析失败：耗时=%.3f秒，错误=%s", elapsed, e)
+                return None
         logging.debug("TulingCloud rotate API response: %s", result)
 
         if result.get("code") not in {0, 1}:
