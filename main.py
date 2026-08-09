@@ -2790,7 +2790,7 @@ def strategic_first_attempt(
 
 
 def login_and_reserve(
-    users, usernames, passwords, action, success_list=None, sessions=None
+    users, usernames, passwords, action, success_list=None, sessions=None, end_dt=None
 ):
     logging.info(
         f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ICONCLICK: {ENABLE_ICONCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
@@ -2905,6 +2905,7 @@ def login_and_reserve(
                 seatid,
                 action,
                 ENDTIME if action else None,
+                end_dt=end_dt,
                 fidEnc=fid_enc,
                 seat_page_id=seat_page_id,
                 use_custom_day=use_custom_day,
@@ -3016,7 +3017,7 @@ def main(users, action=False):
                         if s_obj is not None:
                             s_obj.max_attempt = 1
                 success_list = login_and_reserve(
-                    users, usernames, passwords, action, success_list, sessions
+                    users, usernames, passwords, action, success_list, sessions, end_dt
                 )
         else:
             # 预热结束后仍未成功：未成功配置继续按固定顺序补位尝试
@@ -3062,7 +3063,7 @@ def main(users, action=False):
                         if s_obj is not None:
                             s_obj.max_attempt = 1
             success_list = login_and_reserve(
-                users, usernames, passwords, action, success_list, sessions
+                users, usernames, passwords, action, success_list, sessions, end_dt
             )
 
         print(

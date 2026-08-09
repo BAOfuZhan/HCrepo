@@ -2648,6 +2648,7 @@ class reserve:
         seatid,
         action,
         endtime_hms: str | None = None,
+        end_dt: datetime.datetime | None = None,
         fidEnc: str | None = None,
         seat_page_id: str | None = None,
         use_custom_day=False,
@@ -2710,8 +2711,12 @@ class reserve:
                 )
 
         suc = False
-        normal_captcha_deadline = None
-        if endtime_hms and action:
+        normal_captcha_deadline = end_dt
+        if normal_captcha_deadline is not None and normal_captcha_deadline.tzinfo:
+            normal_captcha_deadline = normal_captcha_deadline.astimezone(
+                datetime.timezone(datetime.timedelta(hours=8))
+            ).replace(tzinfo=None)
+        elif normal_captcha_deadline is None and endtime_hms and action:
             normal_captcha_deadline = _resolve_beijing_end_dt(
                 endtime_hms, _beijing_now_naive()
             )
@@ -2727,10 +2732,12 @@ class reserve:
                 # 如果配置了结束时间，并且在 GitHub Actions 模式下，达到或超过结束时间就立刻停止循环
                 if endtime_hms and action:
                     beijing_now = _beijing_now_naive()
-                    end_dt = _resolve_beijing_end_dt(endtime_hms, beijing_now)
-                    if beijing_now >= end_dt:
+                    loop_end_dt = normal_captcha_deadline or _resolve_beijing_end_dt(
+                        endtime_hms, beijing_now
+                    )
+                    if beijing_now >= loop_end_dt:
                         logging.info(
-                            f"[提交] 当前北京时间 {beijing_now.strftime('%Y-%m-%d %H:%M:%S')} >= 结束时间 {end_dt.strftime('%Y-%m-%d %H:%M:%S')} (ENDTIME {endtime_hms})，停止提交循环"
+                            f"[提交] 当前北京时间 {beijing_now.strftime('%Y-%m-%d %H:%M:%S')} >= 结束时间 {loop_end_dt.strftime('%Y-%m-%d %H:%M:%S')} (end_dt)，停止提交循环"
                         )
                         return suc
 
