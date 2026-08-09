@@ -43,6 +43,7 @@ class GeePassOCR:
                     "bg_image": self._image_b64(out_ring_image),
                 },
                 timeout=timeout_seconds,
+                connect_timeout=9,
             )
         except Exception as exc:
             self.last_error = exc

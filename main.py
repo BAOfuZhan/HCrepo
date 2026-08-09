@@ -1023,6 +1023,8 @@ def strategic_first_attempt(
                         f"[策略] {click_captcha_name} {label} 第 {attempt} 次请求异常：{e}"
                     )
                     captcha = ""
+                if ENABLE_ROTATE:
+                    s.rotate_ocr_provider = captcha_session.rotate_ocr_active_provider
                 if captcha:
                     logging.info(
                         f"[策略] {click_captcha_name} {label} 第 {attempt} 轮处理成功，"
@@ -1403,8 +1405,9 @@ def strategic_first_attempt(
 
                     def _worker(slot_idx: int):
                         try:
+                            worker = _make_textclick_worker()
                             captcha = _resolve_textclick_with_retries(
-                                _make_textclick_worker(),
+                                worker,
                                 f"preheat captcha{slot_idx}",
                                 max_retries=None,
                                 deadline_func=_remaining_captcha_seconds,
@@ -1869,6 +1872,15 @@ def strategic_first_attempt(
                 )
                 return None
 
+            end_dt = _get_beijing_end_dt_from_target(target_dt)
+            if _beijing_now() >= end_dt:
+                logging.warning(
+                    "[策略] 已到结束时间，第 %d 次提交不再按需获取%s验证码",
+                    shot_idx,
+                    click_captcha_name,
+                )
+                return None
+
             logging.warning(
                 f"[策略] 第 {shot_idx} 次提交验证码为空，提交前按需获取{click_captcha_name}验证码"
             )
@@ -1877,6 +1889,7 @@ def strategic_first_attempt(
                     s,
                     f"submit shot {shot_idx} fallback",
                     max_retries=3,
+                    deadline_func=lambda: (end_dt - _beijing_now()).total_seconds(),
                 ) or ""
             else:
                 captcha = s.resolve_captcha(captcha_type) or ""

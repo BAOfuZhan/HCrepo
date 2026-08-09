@@ -387,6 +387,7 @@ class TulingCloudOCR:
                 self.TULINGCLOUD_API_URL,
                 payload,
                 timeout=total_timeout,
+                connect_timeout=9,
             )
         except Exception as e:
             self.last_error = e

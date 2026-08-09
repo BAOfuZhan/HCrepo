@@ -168,7 +168,7 @@ class JfbymOCR:
         logging.info("jfbym 双圈旋转请求已开始，type=%s", self.type_id)
         try:
             result = post_json_with_hard_timeout(
-                self.API_URL, data, timeout=timeout_seconds
+                self.API_URL, data, timeout=timeout_seconds, connect_timeout=9
             )
         except Exception as e:
             self.last_error = e

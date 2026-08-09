@@ -12,7 +12,10 @@ import threading
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Timeout as Urllib3Timeout
+from urllib3.connection import HTTPSConnection
+from urllib3.connectionpool import HTTPSConnectionPool
 from requests.adapters import HTTPAdapter
+from utils.captcha_ocr.hard_timeout import OCRConnectTimeout
 from utils.captcha_ocr import (
     DEFAULT_ICONCLICK_OCR_PROVIDER,
     geepass_token,
@@ -190,12 +193,35 @@ class CredentialRejectedError(RuntimeError):
     """超星明确拒绝登录凭证时抛出，要求外层立即终止程序。"""
 
 
+_office_connect_trace = threading.local()
+
+
+class TimedHTTPSConnection(HTTPSConnection):
+    def _new_conn(self):
+        started_at = time.monotonic()
+        sock = super()._new_conn()
+        self._cx_tcp_trace_id = getattr(_office_connect_trace, "trace_id", None)
+        self._cx_tcp_connect_seconds = time.monotonic() - started_at
+        return sock
+
+
+class TimedHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = TimedHTTPSConnection
+
+
 class OfficeTraceHTTPAdapter(HTTPAdapter):
     """在 send() 层记录 office.chaoxing.com 请求的连接池信息。"""
 
     def __init__(self, owner, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.owner = owner
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            **self.poolmanager.pool_classes_by_scheme,
+            "https": TimedHTTPSConnectionPool,
+        }
 
     @staticmethod
     def _snapshot_pool(pool, url: str) -> dict:
@@ -208,7 +234,12 @@ class OfficeTraceHTTPAdapter(HTTPAdapter):
         }
 
     def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
-        trace_context = getattr(self.owner, "_connection_trace_context", None)
+        header_kind = request.headers.pop("X-CX-Trace-Kind", None)
+        trace_context = (
+            {"kind": header_kind}
+            if header_kind
+            else getattr(self.owner, "_connection_trace_context", None)
+        )
         skip_trace = request.headers.pop("X-CX-Skip-Trace", None) == "1"
         should_trace = bool(
             not skip_trace
@@ -227,14 +258,19 @@ class OfficeTraceHTTPAdapter(HTTPAdapter):
             except Exception as e:
                 before_state["error"] = str(e)
 
-        response = super().send(
-            request,
-            stream=stream,
-            timeout=timeout,
-            verify=verify,
-            cert=cert,
-            proxies=proxies,
-        )
+        trace_id = object()
+        _office_connect_trace.trace_id = trace_id
+        try:
+            response = super().send(
+                request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+            )
+        finally:
+            _office_connect_trace.trace_id = None
 
         if should_trace:
             response_pool = (
@@ -243,6 +279,7 @@ class OfficeTraceHTTPAdapter(HTTPAdapter):
                 or before_pool
             )
             after_state = self._snapshot_pool(response_pool, request.url)
+            connection = getattr(response.raw, "_connection", None)
             trace = {
                 "kind": trace_context.get("kind", ""),
                 "method": getattr(request, "method", ""),
@@ -250,6 +287,12 @@ class OfficeTraceHTTPAdapter(HTTPAdapter):
                 "status_code": getattr(response, "status_code", None),
                 "before": before_state,
                 "after": after_state,
+                "tcp_connect_seconds": (
+                    getattr(connection, "_cx_tcp_connect_seconds", None)
+                    if getattr(connection, "_cx_tcp_trace_id", None) is trace_id
+                    else 0.0
+                ),
+                "connection_reused": getattr(connection, "_cx_tcp_trace_id", None) is not trace_id,
             }
             self.owner._record_office_request_trace(trace)
 
@@ -392,6 +435,7 @@ class reserve:
         self.enable_iconclick = enable_iconclick
         self.enable_rotate = enable_rotate
         self.rotate_ocr_provider = normalize_rotate_ocr_provider(rotate_ocr_provider)
+        self.rotate_ocr_active_provider = self.rotate_ocr_provider
         self.iconclick_ocr_provider = normalize_iconclick_ocr_provider(
             iconclick_ocr_provider
             or os.getenv("ICONCLICK_OCR_PROVIDER", DEFAULT_ICONCLICK_OCR_PROVIDER)
@@ -708,6 +752,16 @@ class reserve:
                 "第一枪轻探测连接复用：%s",
                 self._describe_first_probe_reuse_from_trace(trace),
             )
+            return
+
+        if kind in {"page_token", "seat_submit"}:
+            logging.info(
+                "%s TCP 连接：%s，建连耗时=%.3f秒，状态码=%s",
+                "页面 token" if kind == "page_token" else "预约提交",
+                "复用已有连接" if trace.get("connection_reused") else "新连接成功",
+                float(trace.get("tcp_connect_seconds") or 0),
+                trace.get("status_code"),
+            )
 
     def _describe_first_probe_reuse_from_trace(self, probe_trace: dict) -> str:
         """基于发送层 trace 判断第一枪是否复用了预热连接。"""
@@ -814,6 +868,18 @@ class reserve:
         )
         if "timeout" not in kwargs:
             kwargs["timeout"] = self.request_timeout
+        trace_kind = (
+            "page_token"
+            if request_name == "seat page token fetch"
+            else "seat_submit"
+            if "seat submit" in request_name
+            else ""
+        )
+        if trace_kind:
+            kwargs["headers"] = {
+                **(kwargs.get("headers") or {}),
+                "X-CX-Trace-Kind": trace_kind,
+            }
 
         last_exc = None
         for attempt in range(1, attempts + 1):
@@ -1985,7 +2051,7 @@ class reserve:
                 token, type_id = _get_jfbym_config("rotate")
                 ocr = JfbymOCR(token, type_id)
                 call = lambda: ocr.recognize_rotate_angle(
-                    cutout_bytes, shade_bytes, timeout_seconds=9
+                    cutout_bytes, shade_bytes, timeout_seconds=34
                 )
             return ocr, call
 
@@ -2005,16 +2071,17 @@ class reserve:
             " → ".join(provider_labels[name] for name in provider_order),
         )
         for name in provider_order:
+            self.rotate_ocr_active_provider = name
             try:
                 ocr, call = _provider(name)
             except Exception as error:
                 logging.warning("%s 旋转识别准备失败，不切换平台：%s", name, error)
                 return None
-            for attempt in range(1, 4):
+            connection_failures = recognition_failures = 0
+            while connection_failures < 2 and recognition_failures < 3:
                 logging.info(
-                    "旋转滑块请求识别平台：%s，第%d/3次连接",
+                    "旋转滑块正在请求识别平台：%s",
                     provider_labels[name],
-                    attempt,
                 )
                 angle = call()
                 if angle is not None:
@@ -2023,13 +2090,32 @@ class reserve:
                         "angle": angle,
                         "x": TulingCloudOCR.rotate_angle_to_x(angle),
                     }
-                if not _rotate_network_failure(ocr.last_error):
+                if isinstance(ocr.last_error, OCRConnectTimeout):
+                    connection_failures += 1
+                    logging.warning(
+                        "%s DNS/TCP 连接失败，第%d/2次",
+                        name,
+                        connection_failures,
+                    )
+                    continue
+                recognition_failures += 1
+                logging.warning(
+                    "%s 已连接但识别失败，第%d/3次",
+                    name,
+                    recognition_failures,
+                )
+                if ocr.last_failure_can_fallback:
                     break
-                logging.warning("%s 连接失败，第%d/3次", name, attempt)
-            if not (_rotate_network_failure(ocr.last_error) or ocr.last_failure_can_fallback):
-                logging.warning("%s 为不可切换的业务识别失败，停止平台降级", name)
-                return None
-            logging.warning("%s 不可用，切换下一个旋转识别平台", name)
+            switch_reason = (
+                "连续 2 次 DNS/TCP 连接失败"
+                if connection_failures >= 2
+                else f"已连接但连续 {recognition_failures} 次识别失败"
+            )
+            logging.warning(
+                "%s 因%s，切换下一个旋转识别平台",
+                name,
+                switch_reason,
+            )
         return None
 
     def _recognize_textclick_positions(self, image_url, target_text):

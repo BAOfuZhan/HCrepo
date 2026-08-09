@@ -1,5 +1,8 @@
 import datetime
 import unittest
+from unittest.mock import Mock, patch
+
+import requests
 
 from main import (
     _available_preheated_captchas,
@@ -13,9 +16,67 @@ from main import (
     _store_shared_captcha,
 )
 from utils.reserve import reserve
+from utils.captcha_ocr.jfbym import JfbymOCR
+from utils.captcha_ocr.hard_timeout import OCRConnectTimeout, _curl_json
 
 
 class CaptchaPoolTest(unittest.TestCase):
+    def test_curl_timeout_distinguishes_connect_from_response_wait(self):
+        with patch("utils.captcha_ocr.hard_timeout.subprocess.run") as run:
+            run.return_value = Mock(
+                returncode=28,
+                stdout=b"\n__OCR_META__000,0.000000",
+                stderr=b"",
+            )
+            with self.assertRaises(OCRConnectTimeout):
+                _curl_json("http://ocr", b"{}", "application/json", 34, 9)
+
+            run.return_value.stdout = b"\n__OCR_META__000,0.120000"
+            with self.assertRaises(requests.exceptions.ReadTimeout):
+                _curl_json("http://ocr", b"{}", "application/json", 34, 9)
+
+    def test_jfbym_rotate_uses_nine_second_connect_timeout(self):
+        with patch(
+            "utils.captcha_ocr.jfbym.post_json_with_hard_timeout",
+            return_value={"code": 10000, "data": 90},
+        ) as post:
+            self.assertEqual(
+                JfbymOCR("token", "411115").recognize_rotate_angle(
+                    b"outer", b"inner", timeout_seconds=34
+                ),
+                90,
+            )
+
+        self.assertEqual(post.call_args.kwargs, {"timeout": 34, "connect_timeout": 9})
+
+    def test_rotate_fallback_reports_active_provider_without_changing_preference(self):
+        session = reserve(enable_rotate=True, rotate_ocr_provider="tulingcloud")
+        response = Mock(content=b"image")
+        response.raise_for_status.return_value = None
+        session._get = Mock(return_value=response)
+
+        failed = Mock(last_error=requests.exceptions.ConnectTimeout())
+        failed.compose_rotate_image.return_value = b"composed"
+        failed.recognize_rotate_angle.return_value = None
+        jfbym_timeout = Mock(last_error=OCRConnectTimeout())
+        jfbym_timeout.recognize_rotate_angle.return_value = None
+
+        with (
+            patch("utils.captcha_ocr.TulingCloudOCR", return_value=failed),
+            patch("utils.captcha_ocr.GeePassOCR", return_value=failed),
+            patch("utils.captcha_ocr.JfbymOCR", return_value=jfbym_timeout),
+            patch("utils.captcha_ocr.TulingCloudOCR.rotate_angle_to_x", return_value=50),
+            patch("utils.reserve._get_tulingcloud_config", return_value=("u", "p", "m")),
+        ):
+            self.assertIsNone(session._recognize_rotate_x("shade", "cutout"))
+
+        self.assertEqual(jfbym_timeout.recognize_rotate_angle.call_count, 2)
+        jfbym_timeout.recognize_rotate_angle.assert_called_with(
+            b"image", b"image", timeout_seconds=34
+        )
+        self.assertEqual(session.rotate_ocr_active_provider, "jfbym")
+        self.assertEqual(session.rotate_ocr_provider, "tulingcloud")
+
     def test_simultaneous_reservation_limit_is_terminal(self):
         self.assertTrue(
             reserve._is_terminal_submit_failure("同时预约数量已达上限3次")
