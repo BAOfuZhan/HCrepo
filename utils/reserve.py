@@ -15,9 +15,11 @@ from urllib3.util import Timeout as Urllib3Timeout
 from requests.adapters import HTTPAdapter
 from utils.captcha_ocr import (
     DEFAULT_ICONCLICK_OCR_PROVIDER,
+    geepass_token,
     jfbym_token,
     jfbym_type_id,
     normalize_iconclick_ocr_provider,
+    normalize_rotate_ocr_provider,
     normalize_tulingcloud_captcha_type,
     tulingcloud_model_id,
 )
@@ -110,6 +112,14 @@ def _get_tulingcloud_config(
 def _get_jfbym_config(captcha_type: str | None = "iconclick"):
     """从 captcha_ocr/config.py 获取 jfbym token 和类型 ID。"""
     return jfbym_token(), jfbym_type_id(captcha_type)
+
+
+def _rotate_network_failure(error) -> bool:
+    """仅连接类错误和 502/503/504 可以重试并切换平台。"""
+    if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) in {502, 503, 504}
 
 
 def _recognize_via_server_fallback(kind: str, image_bytes: bytes, **extra):
@@ -259,6 +269,7 @@ class reserve:
         enable_textclick=False,
         enable_iconclick=False,
         enable_rotate=False,
+        rotate_ocr_provider="geepass",
         iconclick_ocr_provider=DEFAULT_ICONCLICK_OCR_PROVIDER,
         reserve_next_day=False,
         reserve_day_offset=None,
@@ -380,6 +391,7 @@ class reserve:
         self.enable_textclick = enable_textclick
         self.enable_iconclick = enable_iconclick
         self.enable_rotate = enable_rotate
+        self.rotate_ocr_provider = normalize_rotate_ocr_provider(rotate_ocr_provider)
         self.iconclick_ocr_provider = normalize_iconclick_ocr_provider(
             iconclick_ocr_provider
             or os.getenv("ICONCLICK_OCR_PROVIDER", DEFAULT_ICONCLICK_OCR_PROVIDER)
@@ -1464,14 +1476,15 @@ class reserve:
 
         x = solve["x"]
         logging.info(
-            "旋转滑块识别成功：角度=%s，坐标 x=%s",
+            "旋转滑块识别成功：平台=%s，角度=%s，坐标 x=%s",
+            solve["provider"],
             solve["angle"],
             x,
         )
         return self._submit_rotate_captcha(captcha_token, captcha_iv, x)
 
     def _resolve_rotate_captcha_with_retry(self, max_attempts: int = 2):
-        """图灵云识别失败时不提交当前验证码，直接重新取一组 rotate。"""
+        """旋转识别失败时不提交当前验证码，直接重新取一组 rotate。"""
         attempts = max(1, int(max_attempts))
         for attempt in range(1, attempts + 1):
             logging.info("正在处理第 %d/%d 个旋转滑块验证码", attempt, attempts)
@@ -1937,23 +1950,87 @@ class reserve:
         if not shade_bytes or not cutout_bytes:
             return None
 
-        try:
-            from utils.captcha_ocr import TulingCloudOCR
+        from utils.captcha_ocr import GeePassOCR, JfbymOCR, TulingCloudOCR
 
-            username, password, model_id = _get_tulingcloud_config(
-                captcha_type="rotate"
-            )
-            if not all([username, password, model_id]):
-                logging.error(
-                    "未配置图灵云账号、密码或旋转滑块模型 ID"
+        def _provider(name: str):
+            if name == "geepass":
+                ocr = GeePassOCR(geepass_token())
+                call = lambda: ocr.recognize_rotate_angle(
+                    cutout_bytes, shade_bytes, timeout_seconds=9
                 )
-                return None
+            elif name == "tulingcloud":
+                username, password, model_id = _get_tulingcloud_config("rotate")
+                ocr = TulingCloudOCR(username, password, model_id)
+                composed = ocr.compose_rotate_image(shade_bytes, cutout_bytes)
 
-            ocr = TulingCloudOCR(username=username, password=password, model_id=model_id)
-            return ocr.solve_rotate_x(shade_bytes, cutout_bytes)
-        except Exception as e:
-            logging.warning("旋转滑块 OCR 失败：%s", e)
-            return None
+                def call():
+                    started_at = time.monotonic()
+                    angle = ocr.recognize_rotate_angle(composed, timeout_seconds=9)
+                    fallback_url = os.getenv("ROTATE_OCR_FALLBACK_URL", "").strip()
+                    remaining = 9 - (time.monotonic() - started_at)
+                    if (
+                        angle is None
+                        and fallback_url
+                        and _rotate_network_failure(ocr.last_error)
+                        and remaining > 0.1
+                    ):
+                        angle = ocr.recognize_rotate_angle_via_fallback(
+                            composed,
+                            url=fallback_url,
+                            api_key=os.getenv("ROTATE_OCR_FALLBACK_API_KEY", ""),
+                            deadline_epoch=time.time() + remaining,
+                        )
+                    return angle
+            else:
+                token, type_id = _get_jfbym_config("rotate")
+                ocr = JfbymOCR(token, type_id)
+                call = lambda: ocr.recognize_rotate_angle(
+                    cutout_bytes, shade_bytes, timeout_seconds=9
+                )
+            return ocr, call
+
+        orders = {
+            "geepass": ("geepass", "tulingcloud", "jfbym"),
+            "tulingcloud": ("tulingcloud", "geepass", "jfbym"),
+            "jfbym": ("jfbym", "geepass", "tulingcloud"),
+        }
+        provider_labels = {
+            "geepass": "GeePass",
+            "tulingcloud": "图灵云",
+            "jfbym": "JFBYM",
+        }
+        provider_order = orders[self.rotate_ocr_provider]
+        logging.info(
+            "旋转滑块识别平台顺序：%s",
+            " → ".join(provider_labels[name] for name in provider_order),
+        )
+        for name in provider_order:
+            try:
+                ocr, call = _provider(name)
+            except Exception as error:
+                logging.warning("%s 旋转识别准备失败，不切换平台：%s", name, error)
+                return None
+            for attempt in range(1, 4):
+                logging.info(
+                    "旋转滑块请求识别平台：%s，第%d/3次连接",
+                    provider_labels[name],
+                    attempt,
+                )
+                angle = call()
+                if angle is not None:
+                    return {
+                        "provider": provider_labels[name],
+                        "angle": angle,
+                        "x": TulingCloudOCR.rotate_angle_to_x(angle),
+                    }
+                if not _rotate_network_failure(ocr.last_error):
+                    break
+                logging.warning("%s 连接失败，第%d/3次", name, attempt)
+            if not (_rotate_network_failure(ocr.last_error) or ocr.last_failure_can_fallback):
+                logging.warning("%s 为不可切换的业务识别失败，停止平台降级", name)
+                return None
+            logging.warning("%s 不可用，切换下一个旋转识别平台", name)
+        return None
 
     def _recognize_textclick_positions(self, image_url, target_text):
         """识别选字验证码中的文字位置。

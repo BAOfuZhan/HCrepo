@@ -198,6 +198,13 @@ server_store/*
 deploy/
 worker2/
 workers/
+!workers/
+workers/*
+!workers/tongyi/
+workers/tongyi/*
+!workers/tongyi/src/
+workers/tongyi/src/*
+!workers/tongyi/src/worker.js
 
 # 测试/辅助脚本
 utils/extract_plan_test.py

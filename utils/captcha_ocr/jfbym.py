@@ -1,4 +1,4 @@
-"""jfbym 图标点选打码平台接口。"""
+"""jfbym 图标点选与双圈旋转打码平台接口。"""
 
 import base64
 import logging
@@ -13,7 +13,7 @@ from .hard_timeout import post_json_with_hard_timeout
 
 
 class JfbymOCR:
-    """www.jfbym.com customApi client for icon-click captcha."""
+    """www.jfbym.com customApi client."""
 
     API_URL = "http://api.jfbym.com/api/YmServer/customApi"
 
@@ -21,6 +21,7 @@ class JfbymOCR:
         self.token = str(token or "").strip()
         self.type_id = str(type_id or "").strip()
         self.last_error = None
+        self.last_failure_can_fallback = False
         self.headers = {"Content-Type": "application/json"}
 
     @staticmethod
@@ -129,3 +130,73 @@ class JfbymOCR:
             logging.debug("jfbym 图标点选未返回可用坐标：%s", result)
             return None
         return positions
+
+    @classmethod
+    def _parse_rotate_angle(cls, payload) -> Optional[float]:
+        if isinstance(payload, dict):
+            if "rotate_angle" in payload:
+                return cls._parse_rotate_angle(payload["rotate_angle"])
+            return cls._parse_rotate_angle(payload.get("data"))
+        if isinstance(payload, list):
+            for item in payload:
+                angle = cls._parse_rotate_angle(item)
+                if angle is not None:
+                    return angle
+            return None
+        try:
+            return float(payload)
+        except (TypeError, ValueError):
+            return None
+
+    def recognize_rotate_angle(
+        self,
+        out_ring_image: bytes,
+        inner_circle_image: bytes,
+        *,
+        timeout_seconds: int = 9,
+    ) -> Optional[float]:
+        """原图提交 411115，返回内圈顺时针旋转角度。"""
+        self.last_error = None
+        self.last_failure_can_fallback = False
+        data = {
+            "out_ring_image": base64.b64encode(out_ring_image).decode("ascii"),
+            "inner_circle_image": base64.b64encode(inner_circle_image).decode("ascii"),
+            "token": self.token,
+            "type": self.type_id,
+        }
+        started_at = time.monotonic()
+        logging.info("jfbym 双圈旋转请求已开始，type=%s", self.type_id)
+        try:
+            result = post_json_with_hard_timeout(
+                self.API_URL, data, timeout=timeout_seconds
+            )
+        except Exception as e:
+            self.last_error = e
+            self.last_failure_can_fallback = getattr(
+                getattr(e, "response", None), "status_code", None
+            ) in {401, 403}
+            logging.warning(
+                "jfbym 双圈旋转请求失败，耗时 %.3f 秒：%s",
+                time.monotonic() - started_at,
+                e,
+            )
+            return None
+
+        if not isinstance(result, dict) or str(result.get("code")) != "10000":
+            code = str(result.get("code", "")) if isinstance(result, dict) else ""
+            message = str(result.get("msg") or result.get("message") or "") if isinstance(result, dict) else ""
+            self.last_failure_can_fallback = code in {"10002", "10003"} or any(
+                word in message.lower() for word in ("余额", "token", "权限", "balance", "unauthorized")
+            )
+            logging.warning("jfbym 双圈旋转识别失败：%s", result)
+            return None
+        angle = self._parse_rotate_angle(result.get("data"))
+        if angle is None:
+            logging.warning("jfbym 双圈旋转未返回角度：%s", result)
+            return None
+        logging.info(
+            "jfbym 双圈旋转识别成功：角度=%s，耗时=%.3f秒",
+            angle,
+            time.monotonic() - started_at,
+        )
+        return angle

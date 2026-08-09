@@ -3,6 +3,8 @@
 业务层只选择验证码类型/识别平台；具体模型 ID 集中放这里。
 """
 
+import os
+
 DEFAULT_ICONCLICK_OCR_PROVIDER = "chaojiying"
 
 TULINGCLOUD_MODEL_IDS = {
@@ -11,6 +13,7 @@ TULINGCLOUD_MODEL_IDS = {
 }
 
 JFBYM_TYPE_IDS = {
+    "rotate": "411115",
     "iconclick": "30104",
 }
 
@@ -32,6 +35,15 @@ def normalize_iconclick_ocr_provider(provider: str | None) -> str:
         "聚福别样": "jfbym",
     }
     return aliases.get(value, DEFAULT_ICONCLICK_OCR_PROVIDER)
+
+
+def normalize_rotate_ocr_provider(provider: str | None) -> str:
+    value = str(provider or "").strip().lower()
+    if value in {"geepass", "极验", "极验通行证"}:
+        return "geepass"
+    if value in {"jfbym", "聚福", "聚福别样"}:
+        return "jfbym"
+    return "tulingcloud"
 
 
 def normalize_tulingcloud_captcha_type(captcha_type: str | None) -> str:
@@ -61,3 +73,7 @@ def jfbym_type_id(captcha_type: str | None) -> str:
 
 def jfbym_token() -> str:
     return JFBYM_TOKEN
+
+
+def geepass_token() -> str:
+    return os.getenv("GEEPASS_TOKEN", "").strip()

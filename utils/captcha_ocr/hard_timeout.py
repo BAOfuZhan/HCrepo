@@ -28,6 +28,8 @@ def _curl_json(url: str, body: bytes, content_type: str, timeout: int) -> dict:
                 "POST",
                 "--header",
                 f"Content-Type: {content_type}",
+                "--write-out",
+                "\n%{http_code}",
                 "--data-binary",
                 "@-",
                 url,
@@ -48,4 +50,11 @@ def _curl_json(url: str, body: bytes, content_type: str, timeout: int) -> dict:
             completed.stderr.decode("utf-8", errors="replace").strip()
             or f"curl exited with code {completed.returncode}"
         )
-    return json.loads(completed.stdout)
+    body, separator, status_text = completed.stdout.rpartition(b"\n")
+    status = int(status_text) if separator and status_text.isdigit() else 0
+    if status >= 400:
+        response = requests.Response()
+        response.status_code = status
+        response._content = body
+        raise requests.exceptions.HTTPError(f"OCR HTTP {status}", response=response)
+    return json.loads(body if separator else completed.stdout)
