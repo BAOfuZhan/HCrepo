@@ -1523,8 +1523,11 @@ class reserve:
             logging.warning("第 %d 次图标验证码识别失败", attempt)
         return ""
 
-    def _resolve_rotate_captcha(self):
+    def _resolve_rotate_captcha(self, deadline_dt=None):
         """旋转滑块验证码求解。"""
+        if deadline_dt is not None and _beijing_now_naive() >= deadline_dt:
+            logging.warning("普通候补旋转验证码已到硬截止时间，不再获取新验证码")
+            return ""
         self.rotate_captcha_processed_count += 1
         logging.info(
             "开始处理旋转滑块验证码（累计第 %d 个）",
@@ -1535,7 +1538,7 @@ class reserve:
             logging.warning("获取旋转滑块验证码数据失败")
             return ""
 
-        solve = self._recognize_rotate_x(shade_url, cutout_url)
+        solve = self._recognize_rotate_x(shade_url, cutout_url, deadline_dt=deadline_dt)
         if not solve:
             logging.warning("旋转滑块识别失败，本次不提交")
             return ""
@@ -1549,12 +1552,18 @@ class reserve:
         )
         return self._submit_rotate_captcha(captcha_token, captcha_iv, x)
 
-    def _resolve_rotate_captcha_with_retry(self, max_attempts: int = 2):
+    def _resolve_rotate_captcha_with_retry(self, max_attempts: int = 2, deadline_dt=None):
         """旋转识别失败时不提交当前验证码，直接重新取一组 rotate。"""
         attempts = max(1, int(max_attempts))
         for attempt in range(1, attempts + 1):
+            if deadline_dt is not None and _beijing_now_naive() >= deadline_dt:
+                logging.warning(
+                    "普通候补旋转验证码重试已到硬截止时间，共处理 %d 轮",
+                    attempt - 1,
+                )
+                return ""
             logging.info("正在处理第 %d/%d 个旋转滑块验证码", attempt, attempts)
-            captcha = self._resolve_rotate_captcha()
+            captcha = self._resolve_rotate_captcha(deadline_dt=deadline_dt)
             if captcha:
                 logging.info(
                     "旋转滑块处理成功：本轮共处理 %d 个验证码",
@@ -1975,7 +1984,7 @@ class reserve:
         )
         return captcha_token, captcha_iv, shade_url, cutout_url
 
-    def _recognize_rotate_x(self, shade_url, cutout_url):
+    def _recognize_rotate_x(self, shade_url, cutout_url, deadline_dt=None):
         c_captcha_headers = {
             "Referer": "https://office.chaoxing.com/",
             "Host": "captcha-b.chaoxing.com",
@@ -1985,12 +1994,15 @@ class reserve:
         def _download(url: str, label: str):
             display_label = "圆图" if label == "shade" else "背景图"
             started_at = time.monotonic()
+            if deadline_dt is not None and _beijing_now_naive() >= deadline_dt:
+                logging.warning("普通候补旋转验证码已到硬截止时间，跳过%s下载", display_label)
+                return None
             try:
                 resp = self._get(
                     url,
                     headers=c_captcha_headers,
                     timeout=5,
-                    attempts=3,
+                    attempts=1 if deadline_dt is not None else 3,
                     request_name=f"rotate {label} image download",
                 )
                 resp.raise_for_status()
@@ -2039,6 +2051,7 @@ class reserve:
                         and fallback_url
                         and _rotate_network_failure(ocr.last_error)
                         and remaining > 0.1
+                        and (deadline_dt is None or _beijing_now_naive() < deadline_dt)
                     ):
                         angle = ocr.recognize_rotate_angle_via_fallback(
                             composed,
@@ -2079,6 +2092,12 @@ class reserve:
                 return None
             connection_failures = recognition_failures = 0
             while connection_failures < 2 and recognition_failures < 3:
+                if deadline_dt is not None and _beijing_now_naive() >= deadline_dt:
+                    logging.warning(
+                        "普通候补旋转识别已到硬截止时间，不再请求%s",
+                        provider_labels[name],
+                    )
+                    return None
                 logging.info(
                     "旋转滑块正在请求识别平台：%s",
                     provider_labels[name],
@@ -2691,6 +2710,11 @@ class reserve:
                 )
 
         suc = False
+        normal_captcha_deadline = None
+        if endtime_hms and action:
+            normal_captcha_deadline = _resolve_beijing_end_dt(
+                endtime_hms, _beijing_now_naive()
+            )
         for slot in candidate_slots:
             slot_roomid = slot["roomid"]
             seat = slot["seatid"]
@@ -2740,7 +2764,10 @@ class reserve:
                             self._rotate_normal_consumed_captcha_count,
                             type(self).rotate_normal_consumed_captcha_limit,
                         )
-                        self._rotate_normal_reusable_captcha = self._resolve_rotate_captcha_with_retry(max_attempts=3)
+                        self._rotate_normal_reusable_captcha = self._resolve_rotate_captcha_with_retry(
+                            max_attempts=3,
+                            deadline_dt=normal_captcha_deadline,
+                        )
                     else:
                         logging.info(
                             "普通候补流程：跨候补座位复用未提交消费的旋转滑块验证码，先查当前候补座位是否空闲；"

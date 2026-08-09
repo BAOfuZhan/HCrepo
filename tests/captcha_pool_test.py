@@ -21,6 +21,19 @@ from utils.captcha_ocr.hard_timeout import OCRConnectTimeout, _curl_json
 
 
 class CaptchaPoolTest(unittest.TestCase):
+    def test_past_normal_rotate_deadline_starts_no_captcha_request(self):
+        session = reserve(enable_rotate=True)
+        session._get = Mock()
+
+        self.assertEqual(
+            session._resolve_rotate_captcha_with_retry(
+                max_attempts=3,
+                deadline_dt=datetime.datetime.now() - datetime.timedelta(seconds=1),
+            ),
+            "",
+        )
+        session._get.assert_not_called()
+
     def test_curl_timeout_distinguishes_connect_from_response_wait(self):
         with patch("utils.captcha_ocr.hard_timeout.subprocess.run") as run:
             run.return_value = Mock(
@@ -68,7 +81,13 @@ class CaptchaPoolTest(unittest.TestCase):
             patch("utils.captcha_ocr.TulingCloudOCR.rotate_angle_to_x", return_value=50),
             patch("utils.reserve._get_tulingcloud_config", return_value=("u", "p", "m")),
         ):
-            self.assertIsNone(session._recognize_rotate_x("shade", "cutout"))
+            self.assertIsNone(
+                session._recognize_rotate_x(
+                    "shade",
+                    "cutout",
+                    deadline_dt=datetime.datetime.now() + datetime.timedelta(seconds=1),
+                )
+            )
 
         self.assertEqual(jfbym_timeout.recognize_rotate_angle.call_count, 2)
         jfbym_timeout.recognize_rotate_angle.assert_called_with(
