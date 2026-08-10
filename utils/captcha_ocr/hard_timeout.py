@@ -1,14 +1,35 @@
 """GitHub OCR HTTP requests with a real wall-clock deadline."""
 
 import json
+import logging
+import socket
+import ssl
 import subprocess
+import time
 from urllib.parse import urlencode
+from urllib.parse import urlparse
 
 import requests
 
 
 class OCRConnectTimeout(requests.exceptions.ConnectTimeout):
     """DNS/TCP connection was not established before the connect deadline."""
+
+
+def probe_http_connection(url: str, timeout: int = 9) -> float:
+    """Probe DNS/TCP/TLS reachability without sending an HTTP request body."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"OCR probe URL has no host: {url}")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    started_at = time.monotonic()
+    with socket.create_connection((host, port), timeout=timeout) as connection:
+        if parsed.scheme == "https":
+            context = ssl.create_default_context()
+            with context.wrap_socket(connection, server_hostname=host):
+                pass
+    return time.monotonic() - started_at
 
 
 def post_json_with_hard_timeout(
@@ -47,7 +68,7 @@ def _curl_json(
                 "--header",
                 f"Content-Type: {content_type}",
                 "--write-out",
-                "\n__OCR_META__%{http_code},%{time_connect}",
+                "\n__OCR_META__%{http_code},%{time_connect},%{time_total}",
                 "--data-binary",
                 "@-",
                 url,
@@ -62,11 +83,20 @@ def _curl_json(
             f"OCR request exceeded {timeout}s wall-clock limit"
         ) from exc
     body, separator, meta = completed.stdout.rpartition(b"\n__OCR_META__")
-    status_text, _, connect_time_text = meta.partition(b",") if separator else (b"", b"", b"")
+    meta_parts = meta.split(b",") if separator else []
+    status_text = meta_parts[0] if meta_parts else b""
+    connect_time_text = meta_parts[1] if len(meta_parts) > 1 else b""
+    total_time_text = meta_parts[2] if len(meta_parts) > 2 else b""
     try:
-        connected = float(connect_time_text) > 0
+        connect_elapsed = float(connect_time_text)
+        connected = connect_elapsed > 0
     except ValueError:
+        connect_elapsed = 0.0
         connected = False
+    try:
+        total_elapsed = float(total_time_text)
+    except ValueError:
+        total_elapsed = 0.0
     if completed.returncode in {6, 7} or (completed.returncode == 28 and not connected):
         raise OCRConnectTimeout(
             f"OCR DNS/TCP connection exceeded {connect_timeout or timeout}s limit"
@@ -74,6 +104,11 @@ def _curl_json(
     if completed.returncode == 28:
         raise requests.exceptions.ReadTimeout(
             f"OCR response exceeded {timeout}s wall-clock limit after connection"
+            + (
+                f"; waited {max(0.0, total_elapsed - connect_elapsed):.3f}s after connection"
+                if total_elapsed
+                else ""
+            )
         )
     if completed.returncode:
         raise requests.exceptions.ConnectionError(
@@ -86,4 +121,9 @@ def _curl_json(
         response.status_code = status
         response._content = body
         raise requests.exceptions.HTTPError(f"OCR HTTP {status}", response=response)
+    logging.info(
+        "OCR HTTP 响应完成：建连耗时=%.3f秒，连接后等待完整响应=%.3f秒",
+        connect_elapsed,
+        max(0.0, total_elapsed - connect_elapsed),
+    )
     return json.loads(body if separator else completed.stdout)

@@ -9,13 +9,14 @@ import logging
 import datetime
 import os
 import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util import Timeout as Urllib3Timeout
 from urllib3.connection import HTTPSConnection
 from urllib3.connectionpool import HTTPSConnectionPool
 from requests.adapters import HTTPAdapter
-from utils.captcha_ocr.hard_timeout import OCRConnectTimeout
+from utils.captcha_ocr.hard_timeout import OCRConnectTimeout, probe_http_connection
 from utils.captcha_ocr import (
     DEFAULT_ICONCLICK_OCR_PROVIDER,
     geepass_token,
@@ -2030,11 +2031,11 @@ class reserve:
 
         from utils.captcha_ocr import GeePassOCR, JfbymOCR, TulingCloudOCR
 
-        def _provider(name: str):
+        def _provider(name: str, timeout_seconds: int = 44):
             if name == "geepass":
                 ocr = GeePassOCR(geepass_token())
                 call = lambda: ocr.recognize_rotate_angle(
-                    cutout_bytes, shade_bytes, timeout_seconds=9
+                    cutout_bytes, shade_bytes, timeout_seconds=timeout_seconds
                 )
             elif name == "tulingcloud":
                 username, password, model_id = _get_tulingcloud_config("rotate")
@@ -2043,9 +2044,11 @@ class reserve:
 
                 def call():
                     started_at = time.monotonic()
-                    angle = ocr.recognize_rotate_angle(composed, timeout_seconds=9)
+                    angle = ocr.recognize_rotate_angle(
+                        composed, timeout_seconds=timeout_seconds
+                    )
                     fallback_url = os.getenv("ROTATE_OCR_FALLBACK_URL", "").strip()
-                    remaining = 9 - (time.monotonic() - started_at)
+                    remaining = timeout_seconds - (time.monotonic() - started_at)
                     if (
                         angle is None
                         and fallback_url
@@ -2064,7 +2067,7 @@ class reserve:
                 token, type_id = _get_jfbym_config("rotate")
                 ocr = JfbymOCR(token, type_id)
                 call = lambda: ocr.recognize_rotate_angle(
-                    cutout_bytes, shade_bytes, timeout_seconds=34
+                    cutout_bytes, shade_bytes, timeout_seconds=timeout_seconds
                 )
             return ocr, call
 
@@ -2083,14 +2086,102 @@ class reserve:
             "旋转滑块识别平台顺序：%s",
             " → ".join(provider_labels[name] for name in provider_order),
         )
+
+        def _continue_primary_with_probed_backup(primary_future, primary_executor):
+            logging.warning(
+                "%s 等待44秒仍无响应，保留原请求至60秒并探测两个备用平台",
+                provider_labels[provider_order[0]],
+            )
+
+            def _attempt(name):
+                try:
+                    ocr, call = _provider(name)
+                    logging.info("旋转滑块并发正式请求平台：%s", provider_labels[name])
+                    return name, call()
+                except Exception as error:
+                    logging.warning("%s 并发旋转识别失败：%s", name, error)
+                    return name, None
+
+            probe_urls = {
+                "geepass": GeePassOCR.API_URL,
+                "tulingcloud": TulingCloudOCR.TULINGCLOUD_API_URL,
+                "jfbym": JfbymOCR.API_URL,
+            }
+
+            def _probe_and_attempt_backup():
+                backups = provider_order[1:]
+                reachable = {}
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rotate-probe") as probes:
+                    probe_futures = {
+                        name: probes.submit(probe_http_connection, probe_urls[name], 9)
+                        for name in backups
+                    }
+                    for name in backups:
+                        try:
+                            elapsed = probe_futures[name].result()
+                            reachable[name] = True
+                            logging.info(
+                                "旋转滑块备用平台连接探测成功：平台=%s，耗时=%.3f秒",
+                                provider_labels[name], elapsed,
+                            )
+                        except Exception as error:
+                            reachable[name] = False
+                            logging.warning(
+                                "旋转滑块备用平台连接探测失败：平台=%s，错误=%s",
+                                provider_labels[name], error,
+                            )
+                selected = next((name for name in backups if reachable[name]), None)
+                if selected is None:
+                    return "", None
+                logging.info("旋转滑块选用备用平台：%s", provider_labels[selected])
+                return _attempt(selected)
+
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rotate-ocr")
+            pending = {
+                primary_future: provider_order[0],
+                executor.submit(_probe_and_attempt_backup): "backup",
+            }
+            try:
+                while pending:
+                    completed, pending_futures = wait(pending, return_when=FIRST_COMPLETED)
+                    pending = {future: pending[future] for future in pending_futures}
+                    for future in sorted(
+                        completed,
+                        key=lambda item: (
+                            provider_order.index(item.result()[0])
+                            if item.result()[0] in provider_order
+                            else len(provider_order)
+                        ),
+                    ):
+                        name, angle = future.result()
+                        if angle is not None:
+                            self.rotate_ocr_active_provider = name
+                            logging.info(
+                                "旋转滑块并发识别率先成功：平台=%s，角度=%s",
+                                provider_labels[name],
+                                angle,
+                            )
+                            return {
+                                "provider": provider_labels[name],
+                                "angle": angle,
+                                "x": TulingCloudOCR.rotate_angle_to_x(angle),
+                            }
+                return None
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+                primary_executor.shutdown(wait=False, cancel_futures=True)
+
         for name in provider_order:
             self.rotate_ocr_active_provider = name
             try:
-                ocr, call = _provider(name)
+                ocr, call = _provider(
+                    name, timeout_seconds=60 if name == provider_order[0] else 44
+                )
             except Exception as error:
                 logging.warning("%s 旋转识别准备失败，不切换平台：%s", name, error)
                 return None
             connection_failures = recognition_failures = 0
+            first_primary_attempt = name == provider_order[0]
             while connection_failures < 2 and recognition_failures < 3:
                 if deadline_dt is not None and _beijing_now_naive() >= deadline_dt:
                     logging.warning(
@@ -2102,7 +2193,23 @@ class reserve:
                     "旋转滑块正在请求识别平台：%s",
                     provider_labels[name],
                 )
-                angle = call()
+                if first_primary_attempt:
+                    primary_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="rotate-primary"
+                    )
+                    primary_future = primary_executor.submit(
+                        lambda: (name, call())
+                    )
+                    completed, _ = wait({primary_future}, timeout=44)
+                    if not completed:
+                        return _continue_primary_with_probed_backup(
+                            primary_future, primary_executor
+                        )
+                    _, angle = primary_future.result()
+                    primary_executor.shutdown(wait=False)
+                    first_primary_attempt = False
+                else:
+                    angle = call()
                 if angle is not None:
                     return {
                         "provider": provider_labels[name],
@@ -2116,6 +2223,7 @@ class reserve:
                         name,
                         connection_failures,
                     )
+                    ocr, call = _provider(name)
                     continue
                 recognition_failures += 1
                 logging.warning(
@@ -2125,6 +2233,7 @@ class reserve:
                 )
                 if ocr.last_failure_can_fallback:
                     break
+                ocr, call = _provider(name)
             switch_reason = (
                 "连续 2 次 DNS/TCP 连接失败"
                 if connection_failures >= 2

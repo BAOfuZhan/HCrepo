@@ -1,4 +1,5 @@
 import datetime
+import concurrent.futures
 import unittest
 from unittest.mock import Mock, patch
 
@@ -38,14 +39,16 @@ class CaptchaPoolTest(unittest.TestCase):
         with patch("utils.captcha_ocr.hard_timeout.subprocess.run") as run:
             run.return_value = Mock(
                 returncode=28,
-                stdout=b"\n__OCR_META__000,0.000000",
+                stdout=b"\n__OCR_META__000,0.000000,9.000000",
                 stderr=b"",
             )
             with self.assertRaises(OCRConnectTimeout):
                 _curl_json("http://ocr", b"{}", "application/json", 34, 9)
 
-            run.return_value.stdout = b"\n__OCR_META__000,0.120000"
-            with self.assertRaises(requests.exceptions.ReadTimeout):
+            run.return_value.stdout = b"\n__OCR_META__000,0.120000,34.000000"
+            with self.assertRaisesRegex(
+                requests.exceptions.ReadTimeout, "waited 33.880s after connection"
+            ):
                 _curl_json("http://ocr", b"{}", "application/json", 34, 9)
 
     def test_jfbym_rotate_uses_nine_second_connect_timeout(self):
@@ -91,10 +94,72 @@ class CaptchaPoolTest(unittest.TestCase):
 
         self.assertEqual(jfbym_timeout.recognize_rotate_angle.call_count, 2)
         jfbym_timeout.recognize_rotate_angle.assert_called_with(
-            b"image", b"image", timeout_seconds=34
+            b"image", b"image", timeout_seconds=44
+        )
+        failed.recognize_rotate_angle.assert_any_call(
+            b"composed", timeout_seconds=60
+        )
+        failed.recognize_rotate_angle.assert_any_call(
+            b"image", b"image", timeout_seconds=44
         )
         self.assertEqual(session.rotate_ocr_active_provider, "jfbym")
         self.assertEqual(session.rotate_ocr_provider, "tulingcloud")
+
+    def test_primary_timeout_probes_backups_and_only_submits_selected_platform(self):
+        session = reserve(enable_rotate=True, rotate_ocr_provider="geepass")
+        response = Mock(content=b"image")
+        response.raise_for_status.return_value = None
+        session._get = Mock(return_value=response)
+
+        first = Mock(last_error=None)
+        first.recognize_rotate_angle.return_value = None
+        second = Mock(last_error=None)
+        second.compose_rotate_image.return_value = b"composed"
+        second.recognize_rotate_angle.return_value = None
+        third = Mock(last_error=None)
+        third.recognize_rotate_angle.return_value = 72
+        second_class = Mock(return_value=second)
+        second_class.TULINGCLOUD_API_URL = "http://tuling.example/ocr"
+        second_class.rotate_angle_to_x.return_value = 64
+        third_class = Mock(return_value=third)
+        third_class.API_URL = "http://api.jfbym.com/ocr"
+
+        def probe(url, timeout):
+            if "jfbym" in url:
+                return 0.2
+            raise requests.exceptions.ConnectTimeout()
+
+        wait_calls = 0
+
+        def soft_timeout_once(futures, **kwargs):
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                return set(), set(futures)
+            return concurrent.futures.wait(futures, **kwargs)
+
+        with (
+            patch("utils.captcha_ocr.GeePassOCR", return_value=first),
+            patch("utils.captcha_ocr.TulingCloudOCR", new=second_class),
+            patch("utils.captcha_ocr.JfbymOCR", new=third_class),
+            patch("utils.reserve._get_tulingcloud_config", return_value=("u", "p", "m")),
+            patch("utils.reserve._get_jfbym_config", return_value=("t", "411115")),
+            patch(
+                "utils.reserve.probe_http_connection",
+                side_effect=probe,
+            ),
+            patch("utils.reserve.wait", side_effect=soft_timeout_once),
+        ):
+            result = session._recognize_rotate_x("shade", "cutout")
+
+        self.assertEqual(result, {"provider": "JFBYM", "angle": 72, "x": 64})
+        first.recognize_rotate_angle.assert_called_once_with(
+            b"image", b"image", timeout_seconds=60
+        )
+        second.recognize_rotate_angle.assert_not_called()
+        third.recognize_rotate_angle.assert_called_once_with(
+            b"image", b"image", timeout_seconds=44
+        )
 
     def test_simultaneous_reservation_limit_is_terminal(self):
         self.assertTrue(
