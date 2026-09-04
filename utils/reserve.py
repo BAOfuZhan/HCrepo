@@ -27,7 +27,12 @@ from utils.captcha_ocr import (
     normalize_tulingcloud_captcha_type,
     tulingcloud_model_id,
 )
-from .time_utils import get_beijing_date, parse_times_range, resolve_request_day
+from .time_utils import (
+    get_beijing_date,
+    is_custom_day_times,
+    parse_times_range,
+    resolve_request_day,
+)
 
 # Load environment variables from .env file
 try:
@@ -198,6 +203,14 @@ _office_connect_trace = threading.local()
 
 
 class TimedHTTPSConnection(HTTPSConnection):
+    def connect(self):
+        started_at = time.monotonic()
+        super().connect()
+        total_seconds = time.monotonic() - started_at
+        self._cx_ssl_handshake_seconds = max(
+            0.0, total_seconds - float(getattr(self, "_cx_tcp_connect_seconds", 0.0))
+        )
+
     def _new_conn(self):
         started_at = time.monotonic()
         sock = super()._new_conn()
@@ -293,7 +306,16 @@ class OfficeTraceHTTPAdapter(HTTPAdapter):
                     if getattr(connection, "_cx_tcp_trace_id", None) is trace_id
                     else 0.0
                 ),
-                "connection_reused": getattr(connection, "_cx_tcp_trace_id", None) is not trace_id,
+                "ssl_handshake_seconds": (
+                    getattr(connection, "_cx_ssl_handshake_seconds", None)
+                    if getattr(connection, "_cx_tcp_trace_id", None) is trace_id
+                    else 0.0
+                ),
+                "connection_reused": (
+                    getattr(connection, "_cx_tcp_trace_id", None) is not trace_id
+                    if connection is not None
+                    else None
+                ),
             }
             self.owner._record_office_request_trace(trace)
 
@@ -446,6 +468,7 @@ class reserve:
         self._captcha_context = {}
         self._connection_trace_context = None
         self._warm_request_trace = {}
+        self._time_sample_request_trace = {}
         preferred_family = str(os.getenv("CX_SEAT_API_MODE", "seat")).strip().lower()
         if preferred_family == "auto":
             preferred_family = "seatengine"
@@ -462,16 +485,6 @@ class reserve:
         self.submit_url = urls["submit"]
         self.seat_url = urls["seat"]
         self.code_url = urls["code"]
-
-    def _alternate_api_family(self, family: str | None = None) -> str:
-        current = str(family or self.api_family or "seatengine").strip().lower()
-        alternates = {
-            "seatengine": "seat",
-            "seat": "seatengine",
-            "seatengine_code": "seat_code",
-            "seat_code": "seatengine_code",
-        }
-        return alternates.get(current, "seatengine")
 
     def _build_token_url_for_family(
         self,
@@ -508,33 +521,8 @@ class reserve:
         )
 
     def _get_select_url_candidates(self, url: str) -> list[tuple[str, str]]:
-        urls = []
-        current_family = self.api_family
         raw = str(url or "")
-        if raw:
-            detected = current_family
-            is_code = "/code?" in raw
-            if "/seatengine/" in raw:
-                detected = "seatengine_code" if is_code else "seatengine"
-            elif "/apps/seat/" in raw or "/data/apps/seat/" in raw:
-                detected = "seat_code" if is_code else "seat"
-            urls.append((detected, raw))
-
-        if raw:
-            parsed = urlparse(raw)
-            params = parse_qs(parsed.query, keep_blank_values=True)
-            family = self._alternate_api_family(detected)
-            candidate = self._build_token_url_for_family(
-                family,
-                (params.get("id") or [""])[0],
-                (params.get("day") or [""])[0],
-                (params.get("seatId") or [""])[0],
-                (params.get("fidEnc") or [""])[0],
-                (params.get("seatNum") or [""])[0],
-            )
-            if not any(existing_url == candidate for _, existing_url in urls):
-                urls.append((family, candidate))
-        return urls
+        return [(self.api_family, raw)] if raw else []
 
     def _submit_with_fallback(self, parm: dict, *, request_name: str):
         family = self.api_family
@@ -753,6 +741,10 @@ class reserve:
                 "第一枪轻探测连接复用：%s",
                 self._describe_first_probe_reuse_from_trace(trace),
             )
+            return
+
+        if kind == "time_sample":
+            self._time_sample_request_trace = trace
             return
 
         if kind in {"page_token", "seat_submit"}:
@@ -1075,7 +1067,7 @@ class reserve:
 
         url_candidates = self._get_select_url_candidates(url)
 
-        for candidate_family, candidate_url in url_candidates:
+        for _, candidate_url in url_candidates:
             attempt = 0
             while True:
                 attempt += 1
@@ -1139,11 +1131,6 @@ class reserve:
                 token = self._extract_submit_enc(html)
                 if token:
                     algorithm_value = token if require_value else ""
-                    if candidate_family != self.api_family:
-                        logging.info(
-                            f"Get page token fallback switched API family to {candidate_family}"
-                        )
-                        self._set_api_family(candidate_family)
                     if attempt > 1:
                         logging.info(
                             f"Get page token from {candidate_url} succeeded on retry attempt {attempt}: {token}"
@@ -2937,13 +2924,19 @@ class reserve:
                         time.sleep(self.sleep_time)
                         self.max_attempt -= 1
                         continue
-                conflict = self.check_getusedtimes_conflict_sync(
-                    normalized_times,
-                    slot_roomid,
-                    seat,
-                    request_day,
-                    fid_enc=slot_fid_enc,
-                )
+                conflict = False
+                if not is_custom_day_times(normalized_times):
+                    conflict = self.check_getusedtimes_conflict_sync(
+                        normalized_times,
+                        slot_roomid,
+                        seat,
+                        request_day,
+                        fid_enc=slot_fid_enc,
+                    )
+                else:
+                    logging.info(
+                        "[提交] 日期型提交跳过时间段查座，继续获取页面 token"
+                    )
                 if conflict is True:
                     logging.info(
                         "[提交] 普通候补 getusedtimes 发现座位冲突，"

@@ -37,17 +37,19 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
     assert not server.user_self_start_blocked(
         {"expiresOn": "2026-07-24", "pausedStreakDays": 6},
-        {"last_paused_at": "2026-07-18T10:00:00+08:00"},
+        {"status": "paused", "last_paused_at": "2026-07-18T10:00:00+08:00"},
         today=datetime.date(2026, 7, 31),
     )
     assert server.user_self_start_blocked(
         {"expiresOn": "2026-07-24", "pausedStreakDays": 6},
-        {"last_paused_at": "2026-07-27T10:00:00+08:00"},
+        {"status": "paused", "last_paused_at": "2026-07-27T10:00:00+08:00"},
         today=datetime.date(2026, 7, 31),
     )
 
     source = (Path(server.BASE_DIR) / "server_api_example.py").read_text(encoding="utf-8")
     assert 'settle_user_pause_after_resume(user) if next_status == "active" else None' in source
+    assert '"/api/internal/user-sync",\n                {"schoolId": school_id, "user": user},' in source
+    assert 'if _sign_runtime_status().get("enabled"):\n            _sync_sign_source_references()' in source
     renewal_source = (Path(server.BASE_DIR) / "renewal.js").read_text(encoding="utf-8")
     assert 'data-action="status"' in renewal_source
     assert 'renewalFetch("/api/admin/user-status"' in renewal_source

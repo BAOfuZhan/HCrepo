@@ -310,6 +310,11 @@ function extractPageToken(html) {
     || "";
 }
 
+function resolveSeatApiFamily(mode) {
+  const value = String(mode || "seat").toLowerCase();
+  return value === "auto" || value.startsWith("seatengine") ? "seatengine" : "seat";
+}
+
 function buildChaoxingSeatPageUrl(school, user, family) {
   const hint = findFirstCompleteUserSeatHint(user);
   const fidEnc = String(hint.fidEnc || school?.fidEnc || "").trim();
@@ -328,8 +333,7 @@ function buildChaoxingSeatPageUrl(school, user, family) {
 }
 
 async function validateChaoxingSeatPage(jar, user, school, maxAttempts = 3) {
-  const mode = String(school?.seat_api_mode || "seat").toLowerCase();
-  const family = mode === "auto" || mode.startsWith("seatengine") ? "seatengine" : "seat";
+  const family = resolveSeatApiFamily(school?.seat_api_mode);
   let lastError = "真实选座页没有返回页面 token";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -370,6 +374,132 @@ function chooseUserForReadingZoneMapping(users) {
     if (account && password) return user;
   }
   return null;
+}
+
+const SEAT_CONFIG_DAY_FIELDS = [
+  ["mon", "周一"], ["tues", "周二"], ["wed", "周三"], ["thur", "周四"],
+  ["fri", "周五"], ["sat", "周六"], ["sun", "周日"],
+];
+
+function normalizeSeatPauseTimes(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return [];
+    try {
+      return normalizeSeatPauseTimes(JSON.parse(text));
+    } catch (_) {
+      return text.split(/[,，;；]/).map(item => item.trim().replace(/\s*[-~至]\s*/g, "～")).filter(Boolean);
+    }
+  }
+  if (!Array.isArray(value)) value = [value];
+  return value.map(item => {
+    if (typeof item === "string") return item.trim().replace(/\s*[-~至]\s*/g, "～");
+    const start = item?.startTime ?? item?.beginTime ?? item?.start;
+    const end = item?.endTime ?? item?.finishTime ?? item?.end;
+    return start != null && end != null ? `${start}～${end}` : JSON.stringify(item);
+  }).filter(Boolean);
+}
+
+function formatSeatConfigNote(seatConfig) {
+  const config = seatConfig && typeof seatConfig === "object" ? seatConfig : {};
+  const common = config.commonTimeConfig && typeof config.commonTimeConfig === "object"
+    ? config.commonTimeConfig
+    : {};
+  const dayRules = [];
+  for (const [field, label] of SEAT_CONFIG_DAY_FIELDS) {
+    const start = String(common[`${field}StartTime`] || "").trim();
+    const end = String(common[`${field}EndTime`] || "").trim();
+    const pauses = normalizeSeatPauseTimes(common[`${field}PauseTimes`]);
+    const signature = JSON.stringify([start, end, pauses]);
+    const previous = dayRules.at(-1);
+    if (previous?.signature === signature) previous.days.push(label);
+    else dayRules.push({ days: [label], start, end, pauses, signature });
+  }
+  const timeText = dayRules.map(({ days, start, end, pauses }) => {
+    const dayText = days.length > 1 ? `${days[0]}～${days.at(-1)}` : days[0];
+    const hours = start && end ? `${start}～${end}` : "未返回";
+    const pauseText = pauses === null
+      ? "（暂停时段未返回）"
+      : (pauses.length ? `（${pauses.join("、")}不可预约）` : "");
+    return `${dayText} ${hours}${pauseText}`;
+  }).join("；");
+  const present = value => value !== undefined && value !== null && value !== "";
+  const beforeDay = config.reserveBeforeDay;
+  const beforeTime = config.reserveBeforeTime;
+  const openText = present(beforeDay) && present(beforeTime)
+    ? `${Number(beforeDay) === 1 ? "前一天" : (Number(beforeDay) === 0 ? "当天" : `提前${beforeDay}天`)}${beforeTime}`
+    : "未返回";
+  const violationText = [
+    present(config.violateTimes) ? `${config.violateTimes}次` : "未返回",
+    present(config.violationLimitDay) ? `${config.violationLimitDay}天统计周期` : "未返回",
+    present(config.violationLimitDuration) ? `限制${config.violationLimitDuration}天` : "未返回",
+  ].join(" / ");
+  let securityText = "未返回";
+  if (Number(config.securityVerify) === 0) securityText = "关闭";
+  if (Number(config.securityVerify) === 1) {
+    const verifyTypeLabels = {
+      2: "选字验证码",
+      3: "图标验证码",
+      4: "滑块验证码 / 旋转滑块验证码",
+    };
+    securityText = `开启，${verifyTypeLabels[Number(config.securityVerifyType)]
+      || (present(config.securityVerifyType) ? `type=${config.securityVerifyType}` : "未返回")}`;
+  }
+  return [
+    "==========【预约规则】==========",
+    `预约开放：${openText}`,
+    `违约规则：${violationText}`,
+    `安全检测：${securityText}`,
+    `可预约时间：${timeText || "未返回"}`,
+    `预约数量限制：${present(config.reserveNumLimit) ? config.reserveNumLimit : "未返回"}`,
+    "==============================",
+  ].join("\n");
+}
+
+async function fetchAndSaveSeatConfig(KV, school) {
+  const users = await getSchoolUsersSnapshot(KV, school.id);
+  const candidates = users.filter(user => {
+    const hint = findFirstUserSeatHint(user);
+    return (user?.phone || user?.username) && user?.password && hint.roomid && (school?.fidEnc || hint.fidEnc);
+  });
+  if (!candidates.length) throw new Error("本组没有同时配置账号、密码、roomid 和 fidEnc 的用户");
+  const user = candidates[Math.floor(Math.random() * candidates.length)];
+  const account = String(user.phone || user.username).trim();
+  const hint = findFirstUserSeatHint(user);
+  const fidEnc = String(school.fidEnc || hint.fidEnc).trim();
+  const jar = await loginChaoxingSession(account, await aesDecrypt(user.password));
+  const family = resolveSeatApiFamily(school.seat_api_mode);
+  const response = await fetchWithTimeout(`https://office.chaoxing.com/data/apps/${family}/room/info`, {
+    method: "POST",
+    headers: {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "Cookie": cookieHeaderFromJar(jar),
+      "Referer": "https://office.chaoxing.com/",
+      "User-Agent": "Mozilla/5.0",
+    },
+    body: new URLSearchParams({
+      id: hint.roomid,
+      toDay: beijingDateWithOffset(resolveScheduleReserveDayOffset(school)),
+      fidEnc,
+    }).toString(),
+  }, 12000);
+  const payload = await response.json().catch(() => null);
+  const seatConfig = payload?.data?.seatConfig;
+  if (!response.ok || !seatConfig) {
+    throw new Error(payload?.msg || `room/info 请求失败（HTTP ${response.status}）`);
+  }
+  const note = formatSeatConfigNote(seatConfig);
+  const prefix = "==========【预约规则】==========";
+  const notes = normalizeSchoolNotes(school.notes);
+  const existingIndex = notes.findIndex(item => item.startsWith(prefix));
+  if (existingIndex >= 0) notes[existingIndex] = note;
+  else if (notes.length >= 20) throw new Error("学校事项已满，请先删除一条事项");
+  else notes.unshift(note);
+  school.notes = normalizeSchoolNotes(notes);
+  await saveSchool(KV, school);
+  return { school, note };
 }
 
 async function fetchChaoxingRoomListForMapping(user, school) {
@@ -588,6 +718,14 @@ function jsonResp(data, status = 200, extraHeaders = {}) {
 
 function normalizeSecretText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeSchoolNotes(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(note => normalizeSecretText(note).slice(0, 300))
+    .filter(Boolean)
+    .slice(0, 20);
 }
 
 function normalizeTimeSeparatorText(value) {
@@ -1045,6 +1183,7 @@ function sanitizeSchoolForClient(school) {
   const { github_token, server_api_key, test_endtime_override, ...rest } = school;
   return {
     ...rest,
+    notes: normalizeSchoolNotes(school.notes),
     test_endtime: normalizeEndtimeHms(school.test_endtime) || "",
     test_trigger_time: normalizeSecretText(school.test_trigger_time) || "",
     test_reserve_day_offset: parseTestReserveDayOffset(school.test_reserve_day_offset),
@@ -1570,6 +1709,7 @@ function defaultSchool(id, name) {
     plan_extract_max_hours: PLAN_EXTRACT_MAX_HOURS_DEFAULT,
     plan_extract_seat_page_id: "",
     reading_zone_groups: [],
+    notes: [],
     repo: `BAOfuZhan/${id}`,
     dispatch_target: "github",
     github_token_key: "",
@@ -2051,6 +2191,7 @@ async function mergeSignStatusForUser(env, schoolId, user) {
 }
 
 async function syncSignFeatureUser(env, schoolId, user) {
+  if (!Object.prototype.hasOwnProperty.call(user, "sign_feature_visible")) return;
   const token = signControlToken(env);
   if (!token) throw new Error("Worker 未配置 SERVER_DISPATCH_API_KEY，无法同步自动签到显示权限");
   const response = await fetch(internalApiUrlFromRenewalEnv(env, "/api/internal/sign-feature-user"), {
@@ -2069,6 +2210,7 @@ async function syncSignFeatureUser(env, schoolId, user) {
 }
 
 async function syncSignControl(env, schoolId, user) {
+  if (!Object.prototype.hasOwnProperty.call(user, "auto_sign_enabled")) return;
   const token = signControlToken(env);
   if (!token) throw new Error("Worker 未配置 SERVER_DISPATCH_API_KEY，无法同步自动签到开关");
   const response = await fetch(internalApiUrlFromRenewalEnv(env, "/api/internal/sign-control"), {
@@ -2077,7 +2219,7 @@ async function syncSignControl(env, schoolId, user) {
     body: JSON.stringify({
       schoolId,
       userId: user.id,
-      enabled: user.sign_feature_visible === true && user.auto_sign_enabled === true,
+      enabled: user.auto_sign_enabled === true,
     }),
   });
   const data = await response.json().catch(() => ({}));
@@ -3581,6 +3723,7 @@ async function handleAPI(request, env, path, ctx = null) {
     if (body.plan_extract_seat_page_id !== undefined) {
       body.plan_extract_seat_page_id = normalizeSecretText(body.plan_extract_seat_page_id);
     }
+    if (body.notes !== undefined) body.notes = normalizeSchoolNotes(body.notes);
     const nextSchool = { ...school, ...body, id: school.id };
     applySchoolFormalTimeGuard(nextSchool, body);
     const timeWindowError = validateFormalTimeWindow(nextSchool.trigger_time, nextSchool.endtime);
@@ -3653,6 +3796,23 @@ async function handleAPI(request, env, path, ctx = null) {
       });
     } catch (error) {
       return jsonResp({ error: error?.message || "阅览区映射失败" }, 502);
+    }
+  }
+
+  // POST /api/school/:id/seat-config/read
+  const seatConfigReadMatch = path.match(/^\/api\/school\/([^/]+)\/seat-config\/read$/);
+  if (method === "POST" && seatConfigReadMatch) {
+    const school = await getSchool(KV, seatConfigReadMatch[1]);
+    if (!school) return jsonResp({ error: "School not found" }, 404);
+    try {
+      const result = await fetchAndSaveSeatConfig(KV, school);
+      return jsonResp({
+        ok: true,
+        school: sanitizeSchoolForClient(result.school),
+        note: result.note,
+      });
+    } catch (error) {
+      return jsonResp({ error: error?.message || "座位规则读取失败" }, 502);
     }
   }
 
@@ -3954,8 +4114,6 @@ async function handleAPI(request, env, path, ctx = null) {
     }
     if (body.auto_sign_enabled !== undefined) {
       user.auto_sign_enabled = user.sign_feature_visible === true && body.auto_sign_enabled === true;
-    } else if (user.sign_feature_visible !== true) {
-      user.auto_sign_enabled = false;
     }
     if (body.schedule) user.schedule = nextSchedule;
     if (body.user_top_config_enabled !== undefined) {
@@ -4156,6 +4314,46 @@ async function handleAPI(request, env, path, ctx = null) {
       unchanged,
       missing,
     });
+  }
+
+  // POST /api/school/:id/users/top-config/disable
+  const disableUserTopConfigMatch = path.match(/^\/api\/school\/([^/]+)\/users\/top-config\/disable$/);
+  if (method === "POST" && disableUserTopConfigMatch) {
+    const schoolId = disableUserTopConfigMatch[1];
+    const school = await getSchool(KV, schoolId);
+    if (!school) return jsonResp({ error: "School not found" }, 404);
+
+    const userIds = await getSchoolUsers(KV, schoolId);
+    let updated = 0;
+    let unchanged = 0;
+    let missing = 0;
+    const changedUsers = [];
+    for (const userId of userIds) {
+      const user = await getUser(KV, schoolId, userId);
+      if (!user) {
+        missing += 1;
+        continue;
+      }
+      if (user.user_top_config_enabled !== true && !Object.keys(user.user_top_config || {}).length) {
+        unchanged += 1;
+        continue;
+      }
+      user.user_top_config_enabled = false;
+      user.user_top_config = {};
+      user.updatedAt = new Date().toISOString();
+      await saveUser(KV, schoolId, user);
+      changedUsers.push(user);
+      updated += 1;
+    }
+    for (const user of changedUsers) {
+      scheduleUserExternalSync(ctx, env, schoolId, user);
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(refreshEmergencySnapshotForChangedUser(env, school, user).catch(error => {
+          console.error(`Emergency top config refresh failed school=${schoolId} user=${user.id}:`, error?.message || String(error));
+        }));
+      }
+    }
+    return jsonResp({ ok: true, total: userIds.length, updated, unchanged, missing });
   }
 
   // POST /api/trigger/:schoolId
@@ -4546,7 +4744,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .mapping-user-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px}
 .mapping-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
 .mapping-note{font-size:12px;color:#777;line-height:1.7;margin-top:10px}
+.school-detail-container{max-width:1200px}
+.school-detail-layout{display:block}
+.school-detail-main{min-width:0}
+.school-notes-launcher{position:fixed;top:180px;right:24px;width:280px;display:grid;justify-items:end;gap:10px;z-index:20}
+.school-notes-toggle{width:64px;height:64px;justify-self:end;padding:0!important;border-radius:50%!important;font-size:14px;font-weight:700;box-shadow:0 7px 20px rgba(102,126,234,.25)!important}
+.school-note-pill{width:100%;padding:11px 14px;border:1px solid #f0d477;border-radius:999px;background:linear-gradient(135deg,#fffdf2,#fff4bf);color:#72530c;font-size:13px;font-weight:600;text-align:center;line-height:1.45;cursor:pointer;box-shadow:0 5px 15px rgba(118,91,20,.1);white-space:normal;overflow-wrap:anywhere}
+.school-note-pill:hover{border-color:#d9ad28;transform:translateY(-1px)}
+.school-note-editor,.school-note-new,.school-notes-empty-editor{display:none;width:100%;background:#fffaf0;border:1px solid #f3df91;border-radius:12px;padding:10px;box-shadow:0 8px 24px rgba(118,91,20,.1)}
+.school-note-editor.show,.school-note-new.show,.school-notes-empty-editor.show{display:block}
+.school-note-editor textarea,.school-note-new textarea,.school-notes-empty-editor textarea{width:100%;min-height:62px;padding:9px;border:1px solid #eadca9;border-radius:8px;background:#fff;font:inherit;font-size:13px;line-height:1.55;resize:vertical;outline:none}
+.school-note-editor textarea:focus,.school-note-new textarea:focus,.school-notes-empty-editor textarea:focus{border-color:#d6a51f;box-shadow:0 0 0 3px rgba(214,165,31,.12)}
+.school-note-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:7px}
+.school-note-actions .btn{padding:5px 10px;font-size:12px}
 @media (max-width: 768px){.mapping-inline,.mapping-user-fields{grid-template-columns:1fr}}
+@media (max-width: 1500px){.school-notes-launcher{position:static;width:100%;margin:0 0 16px}.school-notes-toggle{justify-self:end}.school-note-pill{max-width:320px}}
 @media (max-width: 1000px){.school-list{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width: 680px){.school-list{grid-template-columns:1fr}}
 @media (max-width: 768px){.test-override-row,.global-config-fields,.user-migrate-row,.user-top-config-fields,.renewal-summary,.school-search{grid-template-columns:1fr}.actions,.global-config-actions,.card-actions{flex-wrap:wrap}}
@@ -6443,7 +6655,7 @@ function renderAddSchoolModal() {
             <div class="form-group">
               <label>选座接口模式</label>
               <select id="new_school_seat_api_mode">
-                <option value="auto">auto - 优先 seatengine，失败自动回退</option>
+                <option value="auto">auto - 固定 seatengine，不跨接口回退</option>
                 <option value="seatengine">seatengine - 强制新版接口</option>
                 <option value="seat" selected>seat - 强制旧版接口</option>
                 <option value="seatengine_code">seatengine_code - seatengine code 页面</option>
@@ -6731,12 +6943,15 @@ function renderSchoolDetail() {
     && endSeconds !== null
     && (endSeconds - 40 + 60) % 60 === 0;
   return \`
-    <div class="container">
+    <div class="container school-detail-container">
+      <div class="school-detail-layout">
+      <main class="school-detail-main">
       <div class="header">
         <h1>\${s.name}</h1>
         <div class="actions">
           <button class="btn btn-secondary" onclick="backToSchools()">返回列表</button>
           <button class="btn btn-primary" onclick="showEditSchool()">编辑配置</button>
+          <button id="readSeatConfigBtn" class="btn btn-primary" onclick="readSeatConfigForCurrentSchool()">读取座位规则</button>
           \${managementUrl ? \`<a class="btn btn-primary" href="\${managementUrl}" target="_blank" rel="noopener noreferrer">\${managementLabel}</a>\` : ""}
           <button
             id="scheduleStoreToggleBtn"
@@ -6786,6 +7001,7 @@ function renderSchoolDetail() {
           <div class="card-actions">
             <button class="btn btn-success" onclick="bulkSetUsersStatus('active')">一键全启动</button>
             <button class="btn btn-secondary" onclick="bulkSetUsersStatus('paused')">一键全暂停</button>
+            <button class="btn btn-secondary" onclick="disableAllUserTopConfigs()">关闭全部用户个性化参数</button>
             <button class="btn btn-primary" onclick="showAddUser()">+ 添加用户</button>
           </div>
         </div>
@@ -6806,11 +7022,84 @@ function renderSchoolDetail() {
         </div>
         \${renderPlanMappingPanel()}
       </div>
+      </main>
+      <aside>\${renderSchoolNotesPanel(s)}</aside>
+      </div>
     </div>
     \${renderEditSchoolModal()}
     \${renderUserModal()}
     \${renderUnitBindingWarningModal()}
   \`;
+}
+
+function renderSchoolNotesPanel(school) {
+  const notes = Array.isArray(school?.notes) ? school.notes : [];
+  return \`
+    <section class="school-notes-launcher" aria-label="学校事项">
+      \${notes.map((note, index) => \`
+          <button class="school-note-pill" onclick="toggleSchoolNoteEditor(\${index})">📌 \${escapeHtml(note)}</button>
+          <div class="school-note-editor" id="school_note_editor_\${index}">
+            <textarea id="school_note_\${index}" maxlength="300">\${escapeHtml(note)}</textarea>
+            <div class="school-note-actions">
+              <button class="btn btn-secondary" onclick="deleteSchoolNote(\${index})">删除</button>
+              <button class="btn btn-primary" onclick="saveSchoolNote(\${index})">保存</button>
+            </div>
+          </div>
+      \`).join("")}
+      <button class="btn btn-primary school-notes-toggle" onclick="toggleSchoolNotesPanel()">事项</button>
+      <div class="school-note-new" id="school_notes_panel">
+        <textarea id="new_school_note" maxlength="300" placeholder="输入新的事项……"></textarea>
+        <div class="school-note-actions">
+          <button class="btn btn-success" onclick="addSchoolNote()">新增</button>
+        </div>
+      </div>
+    </section>
+  \`;
+}
+
+function toggleSchoolNotesPanel() {
+  const panel = document.getElementById("school_notes_panel");
+  panel?.classList.toggle("show");
+  if (panel?.classList.contains("show")) document.getElementById("new_school_note")?.focus();
+}
+
+function toggleSchoolNoteEditor(index) {
+  document.getElementById("school_note_editor_" + index)?.classList.toggle("show");
+}
+
+async function persistSchoolNotes(notes, message) {
+  if (!currentSchool?.id) return;
+  const res = await api("PUT", "/api/school/" + currentSchool.id, { notes });
+  if (!res.ok) return toast(res.error || "注意事项保存失败", "error");
+  currentSchool = res.school;
+  schools = upsertSchoolInOrderedList(schools, res.school);
+  render();
+  toast(message, "success");
+}
+
+function addSchoolNote() {
+  const input = document.getElementById("new_school_note");
+  const note = String(input?.value || "").trim();
+  if (!note) return toast("请输入注意事项", "error");
+  const notes = Array.isArray(currentSchool?.notes) ? currentSchool.notes : [];
+  if (notes.length >= 20) return toast("每个学校最多保存 20 条提醒", "error");
+  persistSchoolNotes([...notes, note], "提醒已添加");
+}
+
+function saveSchoolNote(index) {
+  const input = document.getElementById("school_note_" + index);
+  const note = String(input?.value || "").trim();
+  if (!note) return toast("提醒内容不能为空", "error");
+  const notes = [...(Array.isArray(currentSchool?.notes) ? currentSchool.notes : [])];
+  notes[index] = note;
+  persistSchoolNotes(notes, "提醒已保存");
+}
+
+function deleteSchoolNote(index) {
+  if (!confirm("确定删除这条提醒？")) return;
+  const notes = [...(Array.isArray(currentSchool?.notes) ? currentSchool.notes : [])];
+  notes.splice(index, 1);
+  persistSchoolNotes(notes, "提醒已删除");
 }
 
 function renderReadingZonePanel() {
@@ -6950,7 +7239,7 @@ function renderEditSchoolModal() {
             <div class="form-group">
               <label>选座接口模式</label>
               <select id="edit_school_seat_api_mode">
-                <option value="auto" \${s.seat_api_mode==="auto" ? "selected" : ""}>auto - 优先 seatengine，失败自动回退</option>
+                <option value="auto" \${s.seat_api_mode==="auto" ? "selected" : ""}>auto - 固定 seatengine，不跨接口回退</option>
                 <option value="seatengine" \${s.seat_api_mode==="seatengine" ? "selected" : ""}>seatengine - 强制新版接口</option>
                 <option value="seat" \${(!s.seat_api_mode || s.seat_api_mode==="seat") ? "selected" : ""}>seat - 强制旧版接口</option>
                 <option value="seatengine_code" \${s.seat_api_mode==="seatengine_code" ? "selected" : ""}>seatengine_code - seatengine code 页面</option>
@@ -7714,6 +8003,29 @@ function showEditSchool() {
   updateSchoolStrategyNotice();
 }
 
+async function readSeatConfigForCurrentSchool() {
+  if (!currentSchool?.id) return toast("请先打开学校", "error");
+  const button = document.getElementById("readSeatConfigBtn");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "读取中...";
+  }
+  try {
+    const res = await api("POST", "/api/school/" + currentSchool.id + "/seat-config/read");
+    if (!res.ok) return toast(res.error || "座位规则读取失败", "error");
+    currentSchool = res.school || currentSchool;
+    schools = upsertSchoolInOrderedList(schools, currentSchool);
+    render();
+    toast("座位规则已写入事项", "success");
+  } finally {
+    const currentButton = document.getElementById("readSeatConfigBtn");
+    if (currentButton) {
+      currentButton.disabled = false;
+      currentButton.textContent = "读取座位规则";
+    }
+  }
+}
+
 function updateSchoolStrategyNotice() {
   const notice = document.getElementById("edit_strategy_mode_notice");
   const mode = document.getElementById("edit_strategy_mode")?.value;
@@ -8404,6 +8716,16 @@ async function bulkSetUsersStatus(status) {
   }
 }
 
+async function disableAllUserTopConfigs() {
+  if (!currentSchool) return;
+  if (!confirm("确定关闭并清空当前学校所有用户的个性化顶级参数？学校默认参数不会改变。")) return;
+
+  const res = await api("POST", "/api/school/" + currentSchool.id + "/users/top-config/disable");
+  if (!res.ok) return toast(res.error || "批量关闭失败", "error");
+  toast("已关闭 " + (res.updated || 0) + " 名用户的个性化参数，无需变更 " + (res.unchanged || 0) + " 名");
+  openSchool(currentSchool.id);
+}
+
 async function bulkSetConflictGroupUsersStatus(status) {
   if (!currentConflictGroupSchools.length) return;
   const isActive = status === "active";
@@ -8498,7 +8820,10 @@ export {
   buildChaoxingSeatPageUrl,
   didLoginAccountChange,
   extractPageToken,
+  formatSeatConfigNote,
   formalTriggerScope,
+  normalizeSchoolNotes,
+  resolveSeatApiFamily,
   resolveUserTopModeForSchool,
   cloudflareServerFetchUrl,
   validateFormalTimeWindow,
@@ -8539,6 +8864,7 @@ export default {
 export {
   pauseUntilFromDays,
   resumeExpiredPausedUsers,
+  syncSignSettings,
   syncUserDeleteToServer,
   syncUserToServer,
 };

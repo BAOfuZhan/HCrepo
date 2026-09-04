@@ -17,6 +17,7 @@ from server_store.report_reserve_results import (  # noqa: E402
     BEIJING_TZ,
     build_result,
     extract_log_timestamp,
+    report_start_time,
     normalize_text,
     post_json,
 )
@@ -127,11 +128,23 @@ def main() -> int:
     if not isinstance(user, dict):
         user = {}
 
+    started_at = first_log_time(log_path)
+    try:
+        started_dt = dt.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        started_time = (started_dt.replace(tzinfo=BEIJING_TZ) if started_dt.tzinfo is None else started_dt.astimezone(BEIJING_TZ)).time().replace(tzinfo=None)
+    except ValueError:
+        started_time = None
+    start_time = report_start_time(user)
+    is_test_override = normalize_text(user.get("endtime_source"), 20) == "test_override"
+    if is_test_override or (started_time and start_time and started_time < start_time):
+        print(json.dumps({"ok": True, "skipped": True, "reason": "test run before formal endtime minus 10 minutes"}, ensure_ascii=False))
+        return 0
+
     account = normalize_text(user.get("phone") or user.get("username") or os.getenv("CX_USERNAME"), 120)
     run_id = github_run_id() or f"github_{dt.datetime.now(BEIJING_TZ).strftime('%Y%m%d_%H%M%S')}"
     summary = {
         "run_id": run_id,
-        "started_at": first_log_time(log_path),
+        "started_at": started_at,
         "finished_at": finished_time(log_path),
     }
     payload = {"users": [user], **user}

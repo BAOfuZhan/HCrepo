@@ -22,6 +22,7 @@ DEFAULT_RESULT_CENTER_URL = ""
 PROCESSED_RESULTS_FILE = "processed_results.json"
 REPORT_STATE_FILE = "result_report_state.json"
 MAX_LOG_CHARS = 700_000
+DEFAULT_REPORT_BATCH_BYTES = 750_000
 BEIJING_TZ = dt.timezone(dt.timedelta(hours=8))
 REPORT_WINDOWS = {
     "noon": (dt.time(4, 0), dt.time(12, 0)),
@@ -37,6 +38,11 @@ def beijing_now() -> dt.datetime:
 def normalize_text(value: Any, limit: int = 500) -> str:
     text = str(value or "").strip()
     return text[:limit]
+
+
+def normalize_seat(value: Any) -> str:
+    text = normalize_text(value, 80)
+    return text.zfill(3) if text.isdigit() else text
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -55,14 +61,14 @@ def mask_account(account: str) -> str:
 def first_seat(value: Any) -> str:
     if isinstance(value, list):
         for item in value:
-            seat = normalize_text(item, 80)
+            seat = normalize_seat(item)
             if seat:
                 return seat
         return ""
     text = normalize_text(value, 120)
     if "," in text:
-        return normalize_text(text.split(",", 1)[0], 80)
-    return text
+        return normalize_seat(text.split(",", 1)[0])
+    return normalize_seat(text)
 
 
 def unique_join(values: list[str], limit: int = 80) -> str:
@@ -83,7 +89,7 @@ def seat_values(value: Any) -> list[str]:
             if isinstance(item, dict):
                 seats.extend(seat_values(item.get("seatid") or item.get("seat") or item.get("s")))
             else:
-                seat = normalize_text(item, 80)
+                seat = normalize_seat(item)
                 if seat:
                     seats.append(seat)
         return seats
@@ -98,8 +104,19 @@ def seat_values(value: Any) -> list[str]:
         if "-" in token:
             token = token.split("-", 1)[1].strip()
         if token:
-            seats.append(normalize_text(token, 80))
+            seats.append(normalize_seat(token))
     return seats
+
+
+def classify_seat_source(seat: Any, primary_seats: list[str], backup_seats: list[str]) -> str:
+    seat_text = normalize_seat(seat)
+    if seat_text and seat_text in primary_seats:
+        return "primary"
+    if seat_text and seat_text in backup_seats:
+        return "backup"
+    if seat_text and primary_seats and not backup_seats:
+        return "backup"
+    return "unknown"
 
 
 def parse_backup_seat(value: Any) -> str:
@@ -109,7 +126,7 @@ def parse_backup_seat(value: Any) -> str:
                 continue
             seat = normalize_text(item.get("seatid") or item.get("s"), 80)
             if seat:
-                return seat
+                return normalize_seat(seat)
         return ""
     text = normalize_text(value, 500).replace("，", ",")
     for token in text.split(","):
@@ -117,8 +134,8 @@ def parse_backup_seat(value: Any) -> str:
         if not token:
             continue
         if "-" in token:
-            return normalize_text(token.split("-", 1)[1], 80)
-        return normalize_text(token, 80)
+            return normalize_seat(token.split("-", 1)[1])
+        return normalize_seat(token)
     return ""
 
 
@@ -240,6 +257,34 @@ def run_started_at(run_dir: pathlib.Path) -> dt.datetime | None:
     return None
 
 
+def report_start_time(payload: dict) -> dt.time | None:
+    candidates = [payload]
+    users = payload.get("users") or payload.get("reserve")
+    if isinstance(users, list):
+        candidates.extend(item for item in users if isinstance(item, dict))
+    for item in candidates:
+        raw = normalize_text(item.get("endtime") or item.get("endTime"), 20)
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", raw)
+        if not match:
+            continue
+        hour, minute, second = (int(value or 0) for value in match.groups())
+        if hour < 24 and minute < 60 and second < 60:
+            total_seconds = (hour * 3600 + minute * 60 + second - 600) % 86400
+            return dt.time(total_seconds // 3600, total_seconds % 3600 // 60, total_seconds % 60)
+    return None
+
+
+def run_should_skip_as_test(run_dir: pathlib.Path) -> bool:
+    started_at = run_started_at(run_dir)
+    payload = load_json(run_dir / "payload.json", {})
+    users = payload.get("users") or payload.get("reserve") or []
+    candidates = [payload, *(item for item in users if isinstance(item, dict))]
+    if any(normalize_text(item.get("endtime_source"), 20) == "test_override" for item in candidates):
+        return True
+    start_time = report_start_time(payload)
+    return bool(started_at and start_time and started_at.time().replace(tzinfo=None) < start_time)
+
+
 def run_is_active(run_dir: pathlib.Path) -> bool:
     accepted = load_json(run_dir / "accepted.json", {})
     try:
@@ -336,7 +381,7 @@ def success_seat_from_attempt(attempt: dict) -> str:
     if not is_successful_reserve_result(result):
         return ""
     seat_reserve = extract_seat_reserve(result)
-    return normalize_text(seat_reserve.get("seatNum"), 80)
+    return normalize_seat(seat_reserve.get("seatNum"))
 
 
 def success_room_from_attempt(attempt: dict) -> str:
@@ -385,7 +430,7 @@ def extract_submit_attempts(log_text: str) -> list[dict]:
                     end_time = normalize_text(raw_times[1], 20) or end_time
                 current = {
                     "roomId": normalize_text(submit_param.get("roomId"), 80),
-                    "seatNum": normalize_text(submit_param.get("seatNum"), 80),
+                    "seatNum": normalize_seat(submit_param.get("seatNum")),
                     "day": normalize_text(submit_param.get("day"), 32),
                     "startTime": start_time,
                     "endTime": end_time,
@@ -404,7 +449,7 @@ def extract_submit_attempts(log_text: str) -> list[dict]:
                     seat_reserve = extract_seat_reserve(result)
                     if seat_reserve:
                         current["actualRoomId"] = normalize_text(seat_reserve.get("roomId"), 80)
-                        current["actualSeatNum"] = normalize_text(seat_reserve.get("seatNum"), 80)
+                        current["actualSeatNum"] = normalize_seat(seat_reserve.get("seatNum"))
                         current["actualDay"] = normalize_text(seat_reserve.get("today"), 32)
                         current["firstLevelName"] = normalize_text(seat_reserve.get("firstLevelName"), 120)
                         current["secondLevelName"] = normalize_text(seat_reserve.get("secondLevelName"), 120)
@@ -590,7 +635,10 @@ def classify_failure(log_text: str, message: str, returncode: int) -> tuple[str,
         return "account_error", "账户或密码错误，未能完成预约"
     if "login rejected" in combined or "login bootstrap rejected" in combined:
         return "account_error", message or "账户登录失败，未能完成预约"
-    if "验证码" in raw_combined or "captcha" in combined or "empty captcha" in combined:
+    if (
+        "安全验证失败" not in raw_combined
+        and ("验证失败" in raw_combined or "验证码" in raw_combined or "captcha" in combined or "empty captcha" in combined)
+    ):
         return "captcha_failed", message or "验证码处理失败，未能完成预约"
     if "已被占用" in raw_combined or "已有预约" in raw_combined or "conflict=true" in combined:
         return "seat_occupied", message or "座位已被占或当前时间段已有预约"
@@ -668,17 +716,14 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
     for attempt in attempts:
         slot = match_user_slot(user_slots, attempt)
         result = attempt.get("result") if isinstance(attempt.get("result"), dict) else {}
-        attempt_seat = normalize_text(attempt.get("seatNum"), 80)
+        attempt_seat = normalize_seat(attempt.get("seatNum"))
         primary_seats = slot.get("primary") or []
         backup_seats = slot.get("backup") or []
         success = is_successful_reserve_result(result)
         message = normalize_text(result.get("msg") if isinstance(result, dict) else "", 240)
         final_attempt_seat = success_seat_from_attempt(attempt) if success else ""
         source_seat = final_attempt_seat if success else attempt_seat
-        if success:
-            source = "primary" if source_seat and source_seat in primary_seats else "backup"
-        else:
-            source = "primary" if source_seat and source_seat in primary_seats else "backup" if source_seat and source_seat in backup_seats else "unknown"
+        source = classify_seat_source(source_seat, primary_seats, backup_seats)
         location = success_location_from_attempt(attempt) if success else {}
         if success:
             result_text = "首抢成功" if source == "primary" else "备选成功" if source == "backup" else "成功"
@@ -890,6 +935,55 @@ def post_json(url: str, token: str, payload: dict, timeout: float) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def post_results_in_batches(
+    url: str,
+    token: str,
+    results: list[dict],
+    server_id: str,
+    batch_id: str,
+    timeout: float,
+    max_bytes: int = DEFAULT_REPORT_BATCH_BYTES,
+) -> dict:
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    for result in results:
+        candidate = current + [result]
+        payload = {"server_id": server_id, "batch_id": f"{batch_id}_9999", "results": candidate}
+        if current and len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > max_bytes:
+            batches.append(current)
+            current = [result]
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+
+    accepted: list[str] = []
+    rejected: list[dict] = []
+    responses: list[dict] = []
+    for index, batch in enumerate(batches, start=1):
+        response = post_json(
+            url,
+            token,
+            {
+                "server_id": server_id,
+                "batch_id": f"{batch_id}_{index}",
+                "results": batch,
+            },
+            timeout,
+        )
+        responses.append(response)
+        accepted.extend(response.get("accepted") or [])
+        rejected.extend(response.get("rejected") or [])
+
+    return {
+        "ok": all(response.get("ok") for response in responses),
+        "accepted": accepted,
+        "rejected": rejected,
+        "batchCount": len(batches),
+        "responses": responses,
+    }
+
+
 def write_results_to_local_db(results: list[dict]) -> dict:
     from server_store.db import connect, init_db
     from server_store.result_repository import cleanup_expired_results, upsert_result
@@ -1008,22 +1102,37 @@ def main() -> int:
     all_results: list[dict] = []
     processed_runs: list[dict] = []
     skipped_runs: list[str] = []
+    skipped_test_runs: list[str] = []
     for run_dir in run_dirs:
         state_path = run_dir / REPORT_STATE_FILE
         state = load_json(state_path, {})
         if state.get("reported") is True and not args.force:
             skipped_runs.append(run_dir.name)
             continue
+        if run_should_skip_as_test(run_dir):
+            skipped_test_runs.append(run_dir.name)
+            if not args.dry_run:
+                save_json(
+                    state_path,
+                    {
+                        "reported": True,
+                        "skipped": True,
+                        "reason": "test_run_before_formal_endtime_minus_10m",
+                        "reportedAt": beijing_now().isoformat(),
+                        "resultCount": 0,
+                    },
+                )
+            continue
         results, processed = process_run(run_dir, server_id)
         all_results.extend(results)
         processed_runs.append({"runId": run_dir.name, "resultCount": len(results)})
 
     if args.dry_run:
-        print(json.dumps({"ok": True, "dryRun": True, "runs": processed_runs, "results": all_results}, ensure_ascii=False, indent=2))
+        print(json.dumps({"ok": True, "dryRun": True, "runs": processed_runs, "skippedTestRuns": skipped_test_runs, "results": all_results}, ensure_ascii=False, indent=2))
         return 0
 
     if not all_results:
-        print(json.dumps({"ok": True, "message": "no pending results", "window": args.window, "skippedRuns": skipped_runs}, ensure_ascii=False))
+        print(json.dumps({"ok": True, "message": "no pending results", "window": args.window, "skippedRuns": skipped_runs, "skippedTestRuns": skipped_test_runs}, ensure_ascii=False))
         return 0
     if local_db_mode:
         response = write_results_to_local_db(all_results)
@@ -1031,19 +1140,24 @@ def main() -> int:
         print("RESERVE_RESULT_REPORT_TOKEN is required", file=sys.stderr)
         return 2
     else:
-        payload = {
-            "server_id": server_id,
-            "batch_id": f"{server_id}_{beijing_now().strftime('%Y%m%d_%H%M%S')}",
-            "results": all_results,
-        }
-        response = post_json(f"{center_url}/api/reserve-results/batch-report", token, payload, timeout)
+        batch_id = f"{server_id}_{beijing_now().strftime('%Y%m%d_%H%M%S')}"
+        max_batch_bytes = int(os.getenv("RESERVE_RESULT_REPORT_BATCH_BYTES", str(DEFAULT_REPORT_BATCH_BYTES)))
+        response = post_results_in_batches(
+            f"{center_url}/api/reserve-results/batch-report",
+            token,
+            all_results,
+            server_id,
+            batch_id,
+            timeout,
+            max_batch_bytes,
+        )
     ok = bool(response.get("ok"))
     reported_ids = set(response.get("accepted") or [])
     for run in processed_runs:
         run_dir = runs_dir / run["runId"]
         run_results = load_json(run_dir / PROCESSED_RESULTS_FILE, {}).get("results") or []
         run_ids = {item.get("task_id") for item in run_results if isinstance(item, dict)}
-        reported = ok and run_ids.issubset(reported_ids)
+        reported = bool(run_ids) and run_ids.issubset(reported_ids)
         save_json(
             run_dir / REPORT_STATE_FILE,
             {
@@ -1054,7 +1168,7 @@ def main() -> int:
             },
         )
 
-    print(json.dumps({"ok": ok, "window": args.window, "runs": processed_runs, "skippedRuns": skipped_runs, "response": response}, ensure_ascii=False, indent=2))
+    print(json.dumps({"ok": ok, "window": args.window, "runs": processed_runs, "skippedRuns": skipped_runs, "skippedTestRuns": skipped_test_runs, "response": response}, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
 

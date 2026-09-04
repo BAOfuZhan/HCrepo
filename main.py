@@ -143,8 +143,10 @@ def _try_page_prewarm_with_full_window(
 
 from utils import AES_Decrypt, reserve, get_user_credentials
 from utils.reserve import CredentialRejectedError
+from server_time_sampler import run_sampling
 from utils.time_utils import (
     infer_use_custom_day,
+    is_custom_day_times,
     normalize_day_offset,
     parse_times_range,
     resolve_request_day,
@@ -301,6 +303,17 @@ def _store_shared_captcha(results, consumed, captcha):
 
 def _reuse_unsubmitted_captcha(submit_sent, captcha):
     return "" if submit_sent else (captcha or "")
+
+
+def _is_captcha_related_failure(message) -> bool:
+    text = str(message or "")
+    return "安全验证失败" not in text and (
+        "验证失败" in text or "验证码失败" in text
+    )
+
+
+def _should_preheat_date_slider(times, *captcha_flags) -> bool:
+    return is_custom_day_times(times) and not any(captcha_flags)
 
 
 def _click_captcha_preheat_slots(slot_count: int):
@@ -884,9 +897,7 @@ def strategic_first_attempt(
     if now >= target_dt:
         return success_list
 
-    # 等到“目标时间前若干秒”附近再开始策略流程，由 cron 提前少量时间启动
     thirty_before = target_dt - datetime.timedelta(seconds=STRATEGY_LOGIN_LEAD_SECONDS)
-    _wait_until(thirty_before)
 
     usernames_list, passwords_list = None, None
     if action:
@@ -898,7 +909,68 @@ def strategic_first_attempt(
         if len(usernames_list) != len(passwords_list):
             raise Exception("USERNAMES and PASSWORDS count mismatch")
 
+    # 观察模块使用独立登录态；在正式登录前三秒停止，不改变 target_dt。
+    sampler_user = next(
+        (user for user in users if get_current_dayofweek(action) in user.get("daysofweek", [])),
+        None,
+    )
+    if sampler_user is not None:
+        sampler_index = users.index(sampler_user)
+        sampler_username = sampler_user["username"]
+        sampler_password = sampler_user["password"]
+        if action and usernames_list:
+            credential_index = 0 if len(usernames_list) == 1 else sampler_index
+            if credential_index < len(usernames_list):
+                sampler_username = usernames_list[credential_index]
+                sampler_password = passwords_list[credential_index]
+        sampler_day = resolve_request_day(
+            sampler_user["times"],
+            RESERVE_NEXT_DAY,
+            use_custom_day=bool(sampler_user.get("use_custom_day")),
+            reserve_day_offset=RESERVE_DAY_OFFSET,
+        )
+        sampler_start = target_dt - datetime.timedelta(seconds=random.uniform(128, 162))
+        sampler_stop = thirty_before - datetime.timedelta(seconds=3)
+        if sampler_start < sampler_stop:
+            logging.info(
+                "[时间采样][pre_open] 已安排独立采样：start=%s stop=%s；"
+                "结果仅观察，不修改 target_dt",
+                sampler_start,
+                sampler_stop,
+            )
+            sampler_thread = threading.Thread(
+                target=run_sampling,
+                kwargs={
+                    "username": sampler_username,
+                    "password": sampler_password,
+                    "room_id": sampler_user["roomid"],
+                    "to_day": sampler_day,
+                    "fid_enc": sampler_user.get("fidEnc") or "",
+                    "api_family": SEAT_API_MODE,
+                    "sample_type": "pre_open",
+                    "start_at": sampler_start,
+                    "stop_at": sampler_stop,
+                    "target_at": target_dt,
+                },
+                name="server-time-sampler",
+            )
+            sampler_thread.start()
+            # 采样必须完整退出后再进入正式登录阶段，避免两条链路争用网络。
+            sampler_thread.join()
+            logging.info("[时间采样][pre_open] 采样线程已退出，继续正式流程")
+
+    # 原定正式登录时刻不变，并使用全新的预约 Session。
+    _wait_until(thirty_before)
+
     current_dayofweek = get_current_dayofweek(action)
+    date_slider_fallback_needed = bool(
+        not (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK)
+        and any(
+            current_dayofweek in user.get("daysofweek", [])
+            and is_custom_day_times(user.get("times"))
+            for user in users
+        )
+    )
     active_strategy_slot_count = sum(
         1
         for index, user in enumerate(users)
@@ -940,6 +1012,14 @@ def strategic_first_attempt(
         seat_page_id = user.get("seatPageId")
         fid_enc = user.get("fidEnc")
         use_custom_day = bool(user.get("use_custom_day"))
+        date_slider_fallback = _should_preheat_date_slider(
+            times,
+            ENABLE_ROTATE,
+            ENABLE_SLIDER,
+            ENABLE_TEXTCLICK,
+            ENABLE_ICONCLICK,
+        )
+        preheat_slider = ENABLE_SLIDER or date_slider_fallback_needed
         daysofweek = user["daysofweek"]
 
         # 今天不预约该配置，跳过
@@ -1158,7 +1238,7 @@ def strategic_first_attempt(
             if (
                 not warm_done
                 and WARM_CONNECTION_LEAD_MS > 0
-                and (ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK)
+                and (ENABLE_ROTATE or preheat_slider or ENABLE_TEXTCLICK or ENABLE_ICONCLICK)
                 and warm_dt <= captcha_start_dt
             ):
                 warm_done = _try_page_prewarm_with_full_window(
@@ -1209,10 +1289,10 @@ def strategic_first_attempt(
                 )
 
             # 2. 按毫秒提前量等待，统一预热滑块、选字、图标或旋转滑块验证码。
-            if ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
+            if ENABLE_ROTATE or preheat_slider or ENABLE_TEXTCLICK or ENABLE_ICONCLICK:
                 _wait_until(captcha_start_dt)
 
-            if ENABLE_SLIDER:
+            if preheat_slider:
                 active_captcha_type = "slide"
 
                 def _resolve_image_captcha_parallel(slot_idx: int) -> str:
@@ -1225,7 +1305,7 @@ def strategic_first_attempt(
                     worker = reserve(
                         sleep_time=SLEEPTIME,
                         max_attempt=MAX_ATTEMPT,
-                        enable_slider=ENABLE_SLIDER,
+                        enable_slider=preheat_slider,
                         enable_textclick=ENABLE_TEXTCLICK,
                         enable_iconclick=ENABLE_ICONCLICK,
                         enable_rotate=ENABLE_ROTATE,
@@ -1360,7 +1440,9 @@ def strategic_first_attempt(
                                 third_threads = _start_threads([3])
                                 _join_threads_until_deadline(third_threads)
                     else:
-                        all_threads = _start_threads([1, 2, 3])
+                        all_threads = _start_threads(
+                            [1] if date_slider_fallback_needed else [1, 2, 3]
+                        )
                         _join_threads_until_deadline(all_threads)
 
                 captcha1 = live_captcha_results[1]
@@ -1786,7 +1868,7 @@ def strategic_first_attempt(
                 )
 
         def _prepare_slide_captcha_for_submit(shot_idx: int, reason: str):
-            if not ENABLE_SLIDER:
+            if not s.enable_slider:
                 return
 
             _refresh_submit_captchas_from_live_results()
@@ -2246,14 +2328,20 @@ def strategic_first_attempt(
             and not captchas_for_submit[0]
         )
         use_serial_followups = SUBMIT_MODE == "burst" and (
-            skip_first_strategic_submit or background_captcha_zero
+            skip_first_strategic_submit
+            or background_captcha_zero
+            or date_slider_fallback
         )
         effective_submit_mode = "serial" if use_serial_followups else SUBMIT_MODE
         if use_serial_followups:
             reason = (
                 "第一个验证码错过硬截止点"
                 if skip_first_strategic_submit
-                else "多时间段共享池在软截止点仍为 0 份"
+                else (
+                    "日期型无验证配置需要按首枪结果决定是否启用滑块"
+                    if date_slider_fallback
+                    else "多时间段共享池在软截止点仍为 0 份"
+                )
             )
             logging.warning(
                 "[策略] burst 模式下%s；跳过连发计划，改用串行续枪",
@@ -2383,6 +2471,12 @@ def strategic_first_attempt(
                 )
 
             def _serial_followup_seat_is_free(shot_idx: int) -> bool:
+                if is_custom_day_times(times):
+                    logging.info(
+                        "[策略] 第 %d 枪为日期型提交，跳过时间段查座并允许继续提交",
+                        shot_idx,
+                    )
+                    return True
                 conflict = s.check_getusedtimes_conflict_sync(
                     times,
                     serial_target_room,
@@ -2650,6 +2744,26 @@ def strategic_first_attempt(
                 logging.info("[策略] 第一枪未成功，准备第二枪：先准备验证码，再查座，空闲后取新页面 token 提交")
                 first_failure_msg = _last_submit_failure_msg()
                 first_submit_sent = 1 in serial_submitted_shots
+                if (
+                    date_slider_fallback
+                    and first_submit_sent
+                    and _is_captcha_related_failure(first_failure_msg)
+                ):
+                    captcha_required = True
+                    captcha_type = "slide"
+                    click_captcha_name = "滑块"
+                    s.enable_slider = True
+                    _refresh_submit_captchas_from_live_results()
+                    prefetched_slider = next(
+                        (captcha for captcha in captchas_for_submit if captcha),
+                        "",
+                    )
+                    if prefetched_slider:
+                        captchas_for_submit[1] = prefetched_slider
+                    logging.warning(
+                        "[策略] 日期型提交第一枪命中验证码相关失败；"
+                        "第二枪立即启用提前获取的滑块验证码"
+                    )
                 logging.info(
                     "[策略] 第一枪失败原因：%s；是否已发送提交=%s",
                     (

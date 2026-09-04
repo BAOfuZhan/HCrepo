@@ -9,11 +9,13 @@ from main import (
     _available_preheated_captchas,
     _click_captcha_preheat_slots,
     _get_captcha_preheat_deadline,
+    _is_captcha_related_failure,
     _remaining_captcha_preheat_seconds,
     _reuse_unsubmitted_captcha,
     _shared_captcha_preheat_is_serial,
     _should_wait_for_background_followup,
     _should_wait_for_click_preheat,
+    _should_preheat_date_slider,
     _store_shared_captcha,
 )
 from utils.reserve import reserve
@@ -282,6 +284,35 @@ class CaptchaPoolTest(unittest.TestCase):
             "captcha-2",
         )
         self.assertEqual(_reuse_unsubmitted_captcha(True, "captcha-2"), "")
+
+    def test_date_only_no_validation_preheats_slider_fallback(self):
+        self.assertTrue(
+            _should_preheat_date_slider(
+                ["2026-08-31", "2027-01-17"], False, False, False, False
+            )
+        )
+        self.assertFalse(
+            _should_preheat_date_slider(
+                ["08:00", "22:00"], False, False, False, False
+            )
+        )
+        self.assertFalse(
+            _should_preheat_date_slider(
+                ["2026-08-31", "2027-01-17"], False, True, False, False
+            )
+        )
+
+    def test_only_captcha_related_failure_activates_fallback(self):
+        self.assertTrue(_is_captcha_related_failure("验证失败，请重新验证"))
+        self.assertTrue(_is_captcha_related_failure("行为验证失败"))
+        self.assertTrue(_is_captcha_related_failure("验证码失败，请重试"))
+        self.assertFalse(_is_captcha_related_failure("安全验证失败，请刷新"))
+        self.assertFalse(_is_captcha_related_failure("验证码错误，请重试"))
+        self.assertFalse(_is_captcha_related_failure("安全验证未通过"))
+        self.assertFalse(_is_captcha_related_failure("该座位已被占用"))
+        self.assertFalse(
+            _is_captcha_related_failure("页面token为空，需要重新获取token和验证码")
+        )
 
 
 if __name__ == "__main__":

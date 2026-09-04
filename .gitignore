@@ -195,7 +195,14 @@ server_store/
 !server_store/
 server_store/*
 !server_store/report_reserve_results.py
+!server_store/renewal_scan.py
 deploy/
+!deploy/
+deploy/*
+!deploy/systemd/
+deploy/systemd/*
+!deploy/systemd/seat-renewal-catchup.service
+!deploy/systemd/seat-renewal-catchup.timer
 worker2/
 workers/
 !workers/
@@ -208,3 +215,4 @@ workers/tongyi/src/*
 
 # 测试/辅助脚本
 utils/extract_plan_test.py
+scripts/compare_seat_ttfb.py
